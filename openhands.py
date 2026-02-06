@@ -117,6 +117,265 @@ if __name__ == "__main__":
     install_dependencies()
 
 # =============================================================================
+# FIRST-RUN SETUP (migrated from setup.sh)
+# =============================================================================
+
+# Define colors for terminal output
+class Colors:
+    RED = '\033[0;31m'
+    GREEN = '\033[0;32m'
+    YELLOW = '\033[1;33m'
+    CYAN = '\033[0;36m'
+    NC = '\033[0m'  # No Color
+
+
+def load_env_file(env_path: Path) -> Dict[str, str]:
+    """
+    Load environment variables from .env file.
+    
+    Returns dict of loaded variables.
+    """
+    loaded = {}
+    if not env_path.exists():
+        return loaded
+    
+    try:
+        with open(env_path, 'r') as f:
+            for line in f:
+                line = line.strip()
+                # Skip comments and empty lines
+                if not line or line.startswith('#'):
+                    continue
+                # Parse KEY=VALUE
+                if '=' in line:
+                    key, _, value = line.partition('=')
+                    key = key.strip()
+                    value = value.strip()
+                    # Remove quotes if present
+                    if (value.startswith('"') and value.endswith('"')) or \
+                       (value.startswith("'") and value.endswith("'")):
+                        value = value[1:-1]
+                    # Set in environment
+                    os.environ[key] = value
+                    loaded[key] = value
+    except Exception as e:
+        print(f"{Colors.RED}Error loading .env: {e}{Colors.NC}")
+    
+    return loaded
+
+
+# Known placeholder values that indicate unconfigured keys
+PLACEHOLDER_VALUES = {
+    'sk-ant-api03-your-key-here',
+    'sk-your-moonshot-key-here',
+    'tvly-your-key-here',
+    'sk-your-openai-key-here',
+    'sk-or-your-key-here',
+    'your-key-here',
+    '',
+}
+
+
+def check_api_keys() -> Tuple[List[str], List[str]]:
+    """
+    Check for missing or placeholder API keys.
+    
+    Returns:
+        Tuple of (missing_keys, configured_keys)
+    """
+    # Keys to check with their environment variable names
+    keys_to_check = [
+        ('ANTHROPIC_API_KEY', 'Claude'),
+        ('KIMI_API_KEY', 'Moonshot/Kimi'),
+        ('TAVILY_API_KEY', 'Tavily Search'),
+        ('OPENAI_API_KEY', 'OpenAI'),
+        ('OPENROUTER_API_KEY', 'OpenRouter'),
+    ]
+    
+    missing = []
+    configured = []
+    
+    for key, name in keys_to_check:
+        value = os.environ.get(key, '')
+        if not value or value in PLACEHOLDER_VALUES:
+            missing.append(key)
+        else:
+            configured.append(f"{name} ({key[:15]}...)")
+    
+    return missing, configured
+
+
+def substitute_env_in_file(filepath: Path) -> bool:
+    """
+    Substitute environment variables in a file.
+    
+    Replaces ${VAR_NAME} patterns with environment variable values.
+    
+    Returns True if file was modified, False otherwise.
+    """
+    if not filepath.exists():
+        return False
+    
+    try:
+        content = filepath.read_text()
+        original = content
+        
+        # Find all ${VAR_NAME} patterns
+        pattern = re.compile(r'\$\{([^}]+)\}')
+        
+        def replace_var(match):
+            var_name = match.group(1)
+            return os.environ.get(var_name, match.group(0))
+        
+        content = pattern.sub(replace_var, content)
+        
+        # Only write if content changed
+        if content != original:
+            filepath.write_text(content)
+            return True
+        return False
+    except Exception as e:
+        print(f"{Colors.RED}Error processing {filepath}: {e}{Colors.NC}")
+        return False
+
+
+def substitute_all_templates(script_dir: Path) -> int:
+    """
+    Substitute environment variables in all template files.
+    
+    Processes:
+    - templates/llm/*/agent_settings.json
+    - templates/mcp/mcp_servers.json
+    
+    Returns number of files modified.
+    """
+    modified = 0
+    templates_dir = script_dir / "templates"
+    
+    # Process LLM templates
+    llm_dir = templates_dir / "llm"
+    if llm_dir.exists():
+        for template_dir in llm_dir.iterdir():
+            if template_dir.is_dir():
+                settings_file = template_dir / "agent_settings.json"
+                if substitute_env_in_file(settings_file):
+                    print(f"   ✅ {template_dir.name}/agent_settings.json")
+                    modified += 1
+    
+    # Process MCP config
+    mcp_file = templates_dir / "mcp" / "mcp_servers.json"
+    if substitute_env_in_file(mcp_file):
+        print(f"   ✅ mcp/mcp_servers.json")
+        modified += 1
+    
+    return modified
+
+
+def first_run_setup(script_dir: Path, force: bool = False) -> bool:
+    """
+    Perform first-run setup: create .env, check API keys, substitute templates.
+    
+    This replaces the functionality of setup.sh.
+    
+    Args:
+        script_dir: Path to the openhands directory
+        force: If True, run setup even if .env exists
+    
+    Returns:
+        True if setup completed successfully, False if user action needed
+    """
+    env_file = script_dir / ".env"
+    env_example = script_dir / ".env.example"
+    setup_marker = script_dir / ".setup_done"
+    
+    # Skip if already set up (unless forced)
+    if not force and setup_marker.exists():
+        # Still load .env to set environment variables
+        if env_file.exists():
+            load_env_file(env_file)
+        return True
+    
+    print(f"\n{Colors.CYAN}🤖 OpenHands Max Setup{Colors.NC}")
+    print("=" * 50)
+    print()
+    
+    # Step 1: Create .env from .env.example if needed
+    if not env_file.exists():
+        print(f"{Colors.YELLOW}⚠️  .env file not found{Colors.NC}")
+        
+        if env_example.exists():
+            print("Creating from .env.example...")
+            shutil.copy(env_example, env_file)
+            print(f"{Colors.GREEN}✅ Created .env from .env.example{Colors.NC}")
+            print()
+            print(f"{Colors.YELLOW}📝 Please edit .env and add your API keys, then restart.{Colors.NC}")
+            print(f"   File location: {env_file}")
+            print()
+            return False
+        else:
+            print(f"{Colors.RED}❌ .env.example not found{Colors.NC}")
+            return False
+    
+    # Step 2: Load .env
+    print("📁 Loading .env...")
+    loaded = load_env_file(env_file)
+    print(f"   Loaded {len(loaded)} environment variables")
+    print()
+    
+    # Step 3: Check API keys
+    missing_keys, configured_keys = check_api_keys()
+    
+    if missing_keys:
+        # Only warn for the main keys (Anthropic, Kimi, Tavily)
+        main_missing = [k for k in missing_keys if k in ('ANTHROPIC_API_KEY', 'KIMI_API_KEY', 'TAVILY_API_KEY')]
+        if main_missing:
+            print(f"{Colors.YELLOW}⚠️  Missing or placeholder API keys:{Colors.NC}")
+            for key in main_missing:
+                print(f"   - {key}")
+            print()
+            print("Please edit .env and add your real API keys.")
+            print("You can still use the tool with the models that have valid keys.")
+            print()
+    
+    if configured_keys:
+        print(f"{Colors.GREEN}✅ Configured API keys:{Colors.NC}")
+        for key_info in configured_keys:
+            print(f"   - {key_info}")
+        print()
+    
+    # Step 4: Substitute variables in templates
+    print("🔧 Configuring templates...")
+    modified = substitute_all_templates(script_dir)
+    if modified == 0:
+        print("   (no templates needed updating)")
+    print()
+    
+    # Mark setup as done
+    try:
+        setup_marker.write_text(datetime.now().isoformat())
+    except Exception:
+        pass  # Non-critical
+    
+    print(f"{Colors.GREEN}✅ Setup complete!{Colors.NC}")
+    print()
+    
+    # Small delay to let user read output
+    time.sleep(1)
+    
+    return True
+
+
+def rerun_setup(script_dir: Path) -> bool:
+    """
+    Force re-run of setup (useful after editing .env).
+    """
+    setup_marker = script_dir / ".setup_done"
+    if setup_marker.exists():
+        setup_marker.unlink()
+    return first_run_setup(script_dir, force=True)
+
+
+# =============================================================================
 # CONFIGURATION
 # =============================================================================
 
@@ -12632,6 +12891,7 @@ def main():
     parser.add_argument("--help-full", action="store_true", help="Show full help")
     parser.add_argument("--list", action="store_true", help="List projects")
     parser.add_argument("--version", action="store_true", help="Show version")
+    parser.add_argument("--setup", action="store_true", help="Force re-run setup (reload .env, update templates)")
     parser.add_argument("--start-ralph", metavar="PROJECT", help="Start Ralph daemon in container")
     args = parser.parse_args()
     
@@ -12639,6 +12899,17 @@ def main():
         print(f"OpenHands Manager v{VERSION}")
         print(f"Max prompt tokens: {MAX_PROMPT_TOKENS}")
         return
+    
+    # Run first-time setup or re-run if --setup flag is passed
+    # This loads .env, checks API keys, and substitutes templates
+    if args.setup:
+        rerun_setup(SCRIPT_DIR)
+        return
+    
+    if not first_run_setup(SCRIPT_DIR):
+        # Setup incomplete (user needs to edit .env)
+        print("Please configure your .env file and run again.")
+        sys.exit(0)
     
     if args.start_ralph:
         # Start Ralph daemon in container
