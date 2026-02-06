@@ -7684,7 +7684,24 @@ When something fails, add a SIGN here so future iterations avoid the mistake.
         return self.formula_manager.cook_formula(name, self.task_manager, vars)
     
     def cleanup_old_data(self):
-        """Periodic cleanup to prevent unbounded growth."""
+        """Periodic cleanup to prevent unbounded growth.
+        
+        With git-native state (v5.0), most cleanup is skipped since:
+        - Iterations are git commits (use `git log`)
+        - Learnings are git notes (searchable)
+        - Checkpoints are git tags (automatic history)
+        
+        Only disk space emergency cleanup remains active.
+        """
+        # Git-native mode: skip most cleanup, git handles history
+        if self.git_state:
+            # Only check disk space, skip file rotation
+            if self.disk_monitor.is_low_space():
+                log("Low disk space - running emergency cleanup (git-native mode)")
+                self.disk_monitor.emergency_cleanup()
+            return
+        
+        # Legacy mode: full cleanup
         # Check disk space first
         if self.disk_monitor.is_low_space():
             log("Low disk space detected, running emergency cleanup")

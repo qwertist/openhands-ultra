@@ -1605,8 +1605,24 @@ class DiskSpaceMonitor:
         
         FIX: Uses modification time for sorting and protects files newer than 1 hour.
         This prevents deleting files from the current iteration batch.
+        
+        With git-native mode (v3.0), most files are in git, so only log truncation
+        is performed. Iteration history is in git commits.
         """
         stats = {"deleted": 0, "truncated": 0}
+        
+        # Git-native mode: minimal cleanup (only truncate logs)
+        if GIT_STATE_AVAILABLE:
+            max_size = 300_000 if emergency else 500_000
+            if LOG_FILE.exists() and LOG_FILE.stat().st_size > max_size:
+                try:
+                    content = LOG_FILE.read_text()
+                    LOG_FILE.write_text(f"...(rotated)...\n{content[-max_size:]}")
+                    stats["truncated"] += 1
+                    log(f"Git-native cleanup: truncated log")
+                except Exception:
+                    pass
+            return
         
         # Truncate log
         max_size = 300_000 if emergency else 500_000
