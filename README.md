@@ -2,117 +2,68 @@
 
 <div align="center">
 
-![Version](https://img.shields.io/badge/version-5.0.0-blue)
-![Python](https://img.shields.io/badge/python-3.10+-green)
-![License](https://img.shields.io/badge/license-MIT-orange)
-
 **Autonomous AI Coding Agent with Git-Native State Management**
 
-[Features](#-features) • [Installation](#-installation) • [Quick Start](#-quick-start) • [v5.0 Architecture](#-v50-git-native-architecture) • [Formulas](#-formulas)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
+[Quick Start](#-quick-start) • [Features](#-features) • [Commands](#-commands) • [Architecture](#-architecture) • [Configuration](#%EF%B8%8F-configuration)
 
 </div>
 
 ---
 
-## ✨ Features
-
-### 🎯 Core Features
-- **Autonomous Coding** — AI agent works independently on complex projects
-- **Git-Native State** — All state stored in git (refs, tags, notes)
-- **Bead-Style Task IDs** — Structured IDs like `oh-k7m2x` for reliable tracking
-- **Formula System** — TOML templates for reusable workflows
-- **100+ Security Fixes** — Hardened for production use
-
-### 🖥️ Terminal User Interface
-- **Project Management** — Create, configure, and manage AI coding projects
-- **Container Control** — Start, stop, restart Docker containers
-- **Session Management** — Background sessions that survive terminal close
-- **Real-time Monitoring** — Watch agent progress with live output
-
-### 🤖 Ralph Autonomous Daemon (v3.0)
-- **Container-Native** — Runs inside Docker, survives TUI restarts
-- **Smart Context** — 200K+ token support with hierarchical memory
-- **Self-Healing** — Stuck detection with automatic recovery
-- **Git Integration** — Commits, notes, and tags for full history
-
----
-
-## 🆕 v5.0 Git-Native Architecture
-
-### Before (v4.0) → After (v5.0)
-
-| Aspect | v4.0 (Files) | v5.0 (Git-Native) |
-|--------|--------------|-------------------|
-| State | `state.json` | `.git/ralph/*` refs |
-| Checkpoints | `checkpoint.json` | Git tags `ralph/cp/iter-N` |
-| Learnings | `learnings/*.json` | Git notes `refs/notes/learnings` |
-| Iterations | `iterations/*.json` | Commits `[Ralph:Iter:N]` |
-| Handoffs | `handoff.json` | Git notes `refs/notes/handoff` |
-| Tasks | `prd.json` (numbered) | `tasks.json` (bead IDs) |
-
-### Files in `.ralph/` (Reduced from 10+ to 3)
-
-```
-workspace/.ralph/
-├── config.json          # Runtime configuration
-├── tasks.json           # Tasks with IDs (oh-xxxxx)
-└── formulas/            # TOML workflow templates
-    ├── bugfix.toml
-    ├── feature.toml
-    └── refactor.toml
-```
-
-### Git Storage
+## 🚀 Quick Start
 
 ```bash
-# State
-.git/ralph/iteration    # Current iteration number
-.git/ralph/task         # Current task ID  
-.git/ralph/status       # running/paused/stopped
-
-# Checkpoints (git tags)
-git tag -l "ralph/cp/*"
-git show ralph/cp/iter-42
-
-# Iteration history
-git log --grep="[Ralph:Iter:"
-
-# Learnings (git notes)
-git log --show-notes=learnings
-```
-
----
-
-## 📦 Installation
-
-### Prerequisites
-- Python 3.10+
-- Docker (running)
-- Git
-- 4GB+ RAM recommended
-
-### Quick Install
-
-```bash
-# Clone the repository
+# Clone
 git clone https://github.com/qwertist/openhands-max.git
 cd openhands-max
 
-# Copy environment template
+# Configure API keys
 cp .env.example .env
-# Edit .env with your API key
+# Edit .env with your ANTHROPIC_API_KEY
 
-# Run (dependencies auto-install)
+# Run
 python3 openhands.py
 ```
 
-Auto-installs:
-- `textual` — TUI framework
-- `sentence-transformers` — Semantic search (~500MB)
+First run automatically:
+- Creates `.env` from template
+- Installs dependencies (`textual`, `sentence-transformers`)
+- Configures LLM templates
 
 ---
 
-## 🚀 Quick Start
+## ✨ Features
+
+### 🎯 Autonomous Coding
+- **Ralph Daemon** — AI agent runs independently inside Docker
+- **Task Planning** — Automatically breaks projects into tasks
+- **Self-Healing** — Stuck detection with recovery strategies
+- **Architect Reviews** — Periodic code quality checks
+
+### 📦 Git-Native State
+- **Tasks in Git** — Stored as git blob, not files
+- **Full History** — `git reflog` for all state changes
+- **Crash Recovery** — State survives any failure
+- **No File Conflicts** — Atomic operations via git refs
+
+### 🔒 Security Hardened
+- **50+ Security Fixes** — Shell injection, path traversal, ReDoS
+- **Input Validation** — All user inputs sanitized
+- **Credential Protection** — Secrets redacted from logs
+- **Race Condition Free** — Proper locking throughout
+
+### 🧠 Smart Context
+- **200K+ Tokens** — Optimized for large context models
+- **Hierarchical Memory** — Hot/warm/cold tiers
+- **Semantic Search** — Find relevant code instantly
+- **Context Condensing** — Automatic summarization
+
+---
+
+## 📋 Commands
 
 ### Launch TUI
 ```bash
@@ -124,168 +75,155 @@ python3 openhands.py
 python3 openhands.py myproject
 ```
 
-### Using Formulas
-
+### CLI Options
 ```bash
-# Create tasks from a formula
-# (Inside Ralph session or via TUI)
-
-# Bug fix workflow: reproduce → fix → verify
-ralph cook bugfix --var bug_description="Login button doesn't work"
-
-# Feature workflow: design → implement → test → document  
-ralph cook feature --var feature_name="User Auth" --var feature_description="JWT-based authentication"
-
-# Refactor workflow: analyze → test-before → refactor → verify
-ralph cook refactor --var target="auth module" --var goal="Extract middleware"
+python3 openhands.py --help           # Show help
+python3 openhands.py --version        # Show version
+python3 openhands.py --list           # List all projects
+python3 openhands.py --setup          # Re-run initial setup
+python3 openhands.py myproject        # Quick-start specific project
 ```
 
----
+### TUI Keyboard Shortcuts
 
-## 🍳 Formulas
+| Key | Action |
+|-----|--------|
+| `q` | Quit |
+| `n` | New Project |
+| `s` | Start Session |
+| `r` | Start/Monitor Ralph |
+| `p` | Project Settings |
+| `c` | Container Management |
+| `l` | View Logs |
+| `F5` | Refresh |
 
-Formulas are TOML templates that generate related tasks with dependencies.
+### Ralph Monitor Controls
 
-### Example: `bugfix.toml`
-
-```toml
-description = "Standard bug fix workflow"
-formula = "bugfix"
-version = 1
-
-[vars.bug_description]
-description = "Description of the bug"
-required = true
-
-[[steps]]
-id = "reproduce"
-title = "Reproduce the bug"
-description = '''
-{{bug_description}}
-
-Write a failing test that reproduces this bug.'''
-
-[[steps]]
-id = "fix"
-title = "Implement the fix"
-description = "Fix the bug so the test passes."
-needs = ["reproduce"]
-
-[[steps]]
-id = "verify"
-title = "Verify fix"
-description = "Run all tests, ensure no regressions."
-needs = ["fix"]
-```
-
-### Built-in Formulas
-
-| Formula | Steps | Use Case |
-|---------|-------|----------|
-| `bugfix` | reproduce → fix → verify | Fixing bugs |
-| `feature` | design → implement → test → document | New features |
-| `refactor` | analyze → test-before → refactor → verify | Code refactoring |
-
-### Creating Custom Formulas
-
-```bash
-# Create a new formula
-cat > workspace/.ralph/formulas/security-audit.toml << 'EOF'
-description = "Security audit workflow"
-formula = "security-audit"
-version = 1
-
-[[steps]]
-id = "scan"
-title = "Run security scanners"
-description = "Run SAST tools and dependency audit"
-
-[[steps]]
-id = "review"
-title = "Manual code review"
-description = "Review high-risk areas"
-needs = ["scan"]
-
-[[steps]]
-id = "fix"
-title = "Fix vulnerabilities"
-description = "Address identified issues"
-needs = ["review"]
-EOF
-```
+| Key | Action |
+|-----|--------|
+| `p` | Pause/Resume |
+| `s` | Stop Daemon |
+| `l` | View Iteration Logs |
+| `t` | View Tasks |
+| `Esc` | Back (daemon keeps running) |
 
 ---
 
 ## 🏗️ Architecture
 
 ```
-┌────────────────────────────────────────────────────────────────────┐
-│  HOST                                                               │
-│  ┌──────────────────────────────────────────────────────────────┐  │
-│  │  openhands.py (v5.0.0) — TUI Manager                         │  │
-│  │  ├── GitStateManager    ← State in git refs/tags/notes       │  │
-│  │  ├── TaskManager        ← Bead-style IDs (oh-xxxxx)          │  │
-│  │  ├── FormulaManager     ← TOML workflow templates            │  │
-│  │  └── RalphManager       ← Controls daemon lifecycle          │  │
-│  └──────────────────────────────────────────────────────────────┘  │
-│            │ docker exec                                            │
-│            ▼                                                        │
-│  ┌──────────────────────────────────────────────────────────────┐  │
-│  │  DOCKER CONTAINER                                             │  │
-│  │  ┌────────────────────────────────────────────────────────┐  │  │
-│  │  │  ralph_daemon.py (v3.0.0)                               │  │  │
-│  │  │  ├── Git-native state functions                         │  │  │
-│  │  │  ├── HierarchicalMemory (hot/warm/cold)                │  │  │
-│  │  │  ├── SemanticSearch (sentence-transformers)            │  │  │
-│  │  │  ├── ContextCondenser (LLM summarization)              │  │  │
-│  │  │  └── StuckDetector (recovery strategies)               │  │  │
-│  │  └────────────────────────────────────────────────────────┘  │  │
-│  │           │ spawns                                            │  │
-│  │           ▼                                                   │  │
-│  │  ┌────────────────────────────────────────────────────────┐  │  │
-│  │  │  OpenHands Agent Sessions (per iteration)              │  │  │
-│  │  └────────────────────────────────────────────────────────┘  │  │
-│  └──────────────────────────────────────────────────────────────┘  │
-└────────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│  HOST                                                        │
+│  ┌────────────────────────────────────────────────────────┐ │
+│  │  openhands.py (TUI)                                    │ │
+│  │  ├── Project Management                                │ │
+│  │  ├── Container Control (Docker API)                    │ │
+│  │  ├── Ralph Lifecycle (start/stop/monitor)              │ │
+│  │  └── Git-Native State (TaskManager, GitStateManager)   │ │
+│  └────────────────────────────────────────────────────────┘ │
+│            │                                                 │
+│            │ docker exec                                     │
+│            ▼                                                 │
+│  ┌────────────────────────────────────────────────────────┐ │
+│  │  DOCKER CONTAINER                                       │ │
+│  │  ┌──────────────────────────────────────────────────┐  │ │
+│  │  │  ralph_daemon.py                                  │  │ │
+│  │  │  ├── Autonomous iteration loop                   │  │ │
+│  │  │  ├── HierarchicalMemory (context management)     │  │ │
+│  │  │  ├── SemanticSearch (code understanding)         │  │ │
+│  │  │  ├── StuckDetector (recovery strategies)         │  │ │
+│  │  │  └── CircuitBreaker (failure protection)         │  │ │
+│  │  └──────────────────────────────────────────────────┘  │ │
+│  │           │                                             │ │
+│  │           ▼                                             │ │
+│  │  ┌──────────────────────────────────────────────────┐  │ │
+│  │  │  OpenHands Agent (per iteration)                 │  │ │
+│  │  └──────────────────────────────────────────────────┘  │ │
+│  └────────────────────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Git-Native State Storage
+
+```bash
+# Tasks (as git blob)
+git show refs/ralph/tasks
+
+# Current iteration
+cat .git/ralph/iteration
+
+# Current task
+cat .git/ralph/task
+
+# Daemon status
+cat .git/ralph/status
+
+# Checkpoints (as git tags)
+git tag -l "ralph/cp/*"
+
+# Learnings (as git notes)
+git log --show-notes=learnings
+
+# History of any state
+git reflog refs/ralph/tasks
 ```
 
 ---
 
-## 🔒 Security
+## 📁 Project Structure
 
-v5.0 includes 100+ security fixes across multiple review rounds:
-
-### Fixed Vulnerabilities
-- ✅ Path traversal in git refs
-- ✅ Shell injection in subprocess calls
-- ✅ Command injection via heredoc
-- ✅ Session ID injection
-- ✅ MCP config newline injection
-- ✅ PID file race conditions
-- ✅ Unbounded file reads (OOM)
-- ✅ ReDoS in regex patterns
-- ✅ Non-atomic file writes
-
-### Security Features
-- Input sanitization for all git operations
-- Base64 encoding for shell-unsafe content
-- File locking for concurrent access
-- Size limits on all file operations
-- Symlink attack prevention
+```
+openhands-max/
+├── openhands.py              # Main TUI application
+├── .env                      # API keys (create from .env.example)
+├── .env.example              # Template for .env
+├── templates/
+│   ├── llm/                  # LLM configurations
+│   │   ├── claude-sonnet-4/
+│   │   ├── claude-opus-4.5/
+│   │   └── kimi-k2/
+│   ├── mcp/                  # MCP server configs
+│   └── tools/ralph/
+│       ├── ralph_daemon.py   # Autonomous daemon
+│       └── git_state.py      # State management
+├── formulas/                 # Workflow templates (TOML)
+│   ├── bugfix.toml
+│   ├── feature.toml
+│   └── refactor.toml
+└── projects/                 # Your projects (gitignored)
+    └── myproject/
+        ├── workspace/        # Code (mounted in container)
+        │   └── .ralph/       # Runtime config only
+        ├── config/           # LLM settings
+        └── data/             # Persistent data
+```
 
 ---
 
 ## ⚙️ Configuration
 
+### Environment Variables (.env)
+
+```bash
+# Required
+ANTHROPIC_API_KEY=sk-ant-...
+
+# Optional
+OPENAI_API_KEY=sk-...
+KIMI_API_KEY=sk-...
+TAVILY_API_KEY=tvly-...
+```
+
 ### LLM Configuration
 
-Create `config/.openhands/agent_settings.json`:
+Edit `templates/llm/<model>/agent_settings.json`:
 
 ```json
 {
   "llm": {
     "model": "anthropic/claude-sonnet-4-20250514",
-    "api_key": "your-api-key"
+    "api_key": "${ANTHROPIC_API_KEY}",
+    "max_tokens": 8192
   },
   "agent": {
     "type": "CodeActAgent"
@@ -293,98 +231,211 @@ Create `config/.openhands/agent_settings.json`:
 }
 ```
 
-### Environment Variables
+### Ralph Settings
+
+When starting Ralph, configure:
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| Max Iterations | 0 | Limit iterations (0 = unlimited) |
+| Architect Interval | 10 | Code review every N iterations |
+| Condense Interval | 15 | Context summarization frequency |
+
+---
+
+## 🍳 Formulas
+
+Formulas are TOML templates for reusable workflows.
+
+### Use a Formula
 
 ```bash
-# .env file
-ANTHROPIC_API_KEY=sk-ant-...
-OPENAI_API_KEY=sk-...
+# In Ralph session or TUI
+ralph cook bugfix --var bug_description="Login fails"
+ralph cook feature --var feature_name="Auth" --var feature_description="JWT auth"
+```
+
+### Built-in Formulas
+
+**bugfix.toml** — Bug fix workflow
+```
+reproduce → fix → verify
+```
+
+**feature.toml** — New feature workflow
+```
+design → implement → test → document
+```
+
+**refactor.toml** — Refactoring workflow
+```
+analyze → test-before → refactor → verify
+```
+
+### Create Custom Formula
+
+```toml
+# formulas/my-workflow.toml
+description = "My custom workflow"
+
+[vars.target]
+description = "What to work on"
+required = true
+
+[[steps]]
+id = "step1"
+title = "First step"
+description = "Do {{target}}"
+
+[[steps]]
+id = "step2"
+title = "Second step"
+description = "Verify {{target}}"
+needs = ["step1"]
 ```
 
 ---
 
-## 📊 Task Management
+## 🐳 Docker Management
 
-### Task Format (v2)
+### Container Commands
 
-```json
-{
-  "version": 2,
-  "project": "myapp",
-  "tasks": {
-    "oh-a1b2c": {
-      "title": "Setup authentication",
-      "description": "Implement JWT auth",
-      "status": "done",
-      "depends": []
-    },
-    "oh-d3e4f": {
-      "title": "Add user profile",
-      "status": "active",
-      "depends": ["oh-a1b2c"]
-    }
-  }
-}
+```bash
+# List containers
+docker ps -a | grep openhands
+
+# Shell into container
+docker exec -it openhands-myproject bash
+
+# View daemon logs
+docker exec openhands-myproject cat /workspace/.ralph/ralph_daemon.log
+
+# Check daemon status
+docker exec openhands-myproject pgrep -f ralph_daemon.py
 ```
 
-### Task Statuses
-- `pending` — Not started, waiting for dependencies
-- `active` — Currently being worked on
-- `done` — Completed successfully
-- `failed` — Failed, needs attention
-- `blocked` — Blocked by external factor
+### Manual Daemon Control
 
----
-
-## 🛠️ Troubleshooting
-
-### Check Ralph Status
 ```bash
-# In container
-cat /workspace/.ralph/heartbeat
-cat .git/ralph/status
-git log --oneline -5 --grep="[Ralph:Iter:"
-```
+# Start daemon
+docker exec openhands-myproject bash -c "
+  cd /workspace
+  setsid python3 -u /workspace/.ralph/ralph_daemon.py &
+"
 
-### View Learnings
-```bash
-git log --show-notes=learnings -10
-```
+# Stop daemon
+docker exec openhands-myproject pkill -f ralph_daemon.py
 
-### Recovery from Crash
-```bash
-# Check latest checkpoint
-git tag -l "ralph/cp/*" | tail -1
-git show ralph/cp/iter-42
-```
-
-### Reset State
-```bash
-# Clear all Ralph state
-rm -rf .git/ralph/
-git notes --ref=learnings remove --all
+# View heartbeat
+docker exec openhands-myproject cat /workspace/.ralph/heartbeat
 ```
 
 ---
 
-## 📈 Version History
+## 🔧 Troubleshooting
 
-### v5.0.0 (Current)
-- Git-native state management
-- Bead-style task IDs
-- Formula system (TOML templates)
-- 100+ security fixes
-- Removed file rotation (git handles history)
+### Common Issues
 
-### v4.0.0
-- Container-native daemon
-- Hierarchical memory
-- Semantic search
-- Context condensing
+**"Docker not available"**
+```bash
+sudo systemctl start docker
+# or on macOS: open -a Docker
+```
 
-### v3.0.0
-- Initial Ralph daemon
-- Basic task management
+**"Container won't start"**
+```bash
+docker pull docker.openhands.dev/openhands/runtime:latest-nikolaik
+docker system prune -a  # Free space
+```
+
+**"Daemon keeps crashing"**
+```bash
+# Check logs
+docker exec openhands-myproject cat /workspace/.ralph/ralph_daemon.log
+
+# Check dependencies
+docker exec openhands-myproject python3 -c "import sentence_transformers; print('OK')"
+```
+
+**"Tasks not syncing"**
+```bash
+# Check git state
+docker exec openhands-myproject git show refs/ralph/tasks
+
+# Force refresh
+docker exec openhands-myproject git reflog refs/ralph/tasks
+```
+
+### Debug Commands
+
+```bash
+# Full system status
+python3 openhands.py --list
+
+# Container resources
+docker stats openhands-myproject
+
+# Daemon memory usage
+docker exec openhands-myproject ps aux | grep ralph
+```
+
+---
+
+## 📊 Monitoring
+
+### Ralph Status
+
+The TUI shows real-time status:
+- Current iteration
+- Active task
+- Heartbeat age
+- Memory usage
+- Recent output
+
+### Logs
+
+```bash
+# Daemon log (all output)
+~/openhands/projects/myproject/workspace/.ralph/ralph_daemon.log
+
+# Per-iteration logs
+~/openhands/projects/myproject/workspace/.ralph/iterations/
+
+# Watchdog log
+~/openhands/projects/myproject/workspace/.ralph/watchdog.log
+```
+
+### Metrics
+
+Ralph tracks:
+- Iterations completed/failed
+- Tasks done/pending
+- Stuck recoveries
+- Circuit breaker trips
+
+---
+
+## 🔒 Security
+
+### Implemented Protections
+
+- ✅ Shell injection prevention (shlex.quote, stdin passing)
+- ✅ Path traversal blocking (resolve + relative_to)
+- ✅ Symlink attack prevention
+- ✅ ReDoS protection (line-by-line processing)
+- ✅ Log injection sanitization
+- ✅ Credential redaction in output
+- ✅ PID file race condition fix (flock)
+- ✅ Atomic file operations
+- ✅ Input validation on all user data
+- ✅ Command allowlists for MCP
+
+### Best Practices
+
+- Keep `.env` out of git (already in .gitignore)
+- Use dedicated API keys per project
+- Review daemon logs for anomalies
+- Keep Docker images updated
 
 ---
 
@@ -392,31 +443,30 @@ git notes --ref=learnings remove --all
 
 1. Fork the repository
 2. Create feature branch (`git checkout -b feature/amazing`)
-3. Run tests (`python -m pytest tests/`)
-4. Commit changes (`git commit -m 'Add amazing feature'`)
-5. Push branch (`git push origin feature/amazing`)
-6. Open Pull Request
+3. Make changes
+4. Run tests (`python3 -m pytest tests/`)
+5. Commit (`git commit -m 'Add amazing feature'`)
+6. Push (`git push origin feature/amazing`)
+7. Open Pull Request
 
 ---
 
 ## 📄 License
 
-MIT License - see [LICENSE](LICENSE)
+MIT License — see [LICENSE](LICENSE)
 
 ---
 
 ## 🙏 Acknowledgments
 
 - [OpenHands](https://github.com/All-Hands-AI/OpenHands) — AI coding agent
-- [Gastown](https://github.com/steveyegge/gastown) — Inspiration for git-native state
+- [Gastown](https://github.com/steveyegge/gastown) — Git-native state inspiration
 - [Textual](https://github.com/Textualize/textual) — TUI framework
 
 ---
 
 <div align="center">
 
-**Built with ❤️ for autonomous coding**
-
-[⬆ Back to Top](#-openhands-max)
+**Built for autonomous coding** 🚀
 
 </div>
