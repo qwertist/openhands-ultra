@@ -51,6 +51,9 @@ def generate_task_id(prefix: str = "oh") -> str:
     # Validate prefix
     if not prefix or not prefix.isalnum() or len(prefix) < 2 or len(prefix) > 10:
         raise ValueError(f"Invalid prefix: {prefix!r} (must be 2-10 alphanumeric chars)")
+    # FIX: Require at least one letter (digits-only prefixes like "12" are confusing)
+    if prefix.isdigit():
+        raise ValueError(f"Prefix must contain at least one letter: {prefix!r}")
     return f"{prefix}-{secrets.token_hex(3)[:5]}"
 
 
@@ -270,6 +273,9 @@ class GitStateManager:
         # Prevent path traversal
         if '..' in ref_name or ref_name.startswith('/'):
             return False
+        # FIX: Reject consecutive slashes (invalid in git)
+        if '//' in ref_name:
+            return False
         # Max length
         if len(ref_name) > 200:
             return False
@@ -403,10 +409,9 @@ class GitStateManager:
                     fcntl.flock(f.fileno(), fcntl.LOCK_UN)
         except Exception as e:
             logger.error(f"Failed to increment iteration: {e}")
-            # Fallback to non-atomic increment
-            n = self.get_iteration() + 1
-            self.set_iteration(n)
-            return n
+            # FIX: Retry with delay instead of non-atomic fallback (prevents duplicate iteration numbers)
+            time.sleep(0.1)
+            return self.increment_iteration()
     
     def get_current_task(self) -> str:
         """Get current task ID."""

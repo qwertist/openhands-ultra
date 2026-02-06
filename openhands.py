@@ -115,7 +115,7 @@ if __name__ == "__main__":
 # CONFIGURATION
 # =============================================================================
 
-VERSION = "5.0.0"  # Git-native state management with bead-style task IDs
+VERSION = "5.1.0"  # Git-native state management with bead-style task IDs
 
 # Runtime image - contains Python, Node, tools for agent
 RUNTIME_IMAGE = "docker.openhands.dev/openhands/runtime:latest-nikolaik"
@@ -164,7 +164,7 @@ MIN_FREE_SPACE_MB = 500
 VALID_PROJECT_NAME_PATTERN = re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9_-]*$')
 
 # FIX: Docker reserved container names that could cause conflicts
-DOCKER_RESERVED_NAMES = {'scratch', 'builder', 'host', 'null', 'root', 'bridge', 'none'}
+DOCKER_RESERVED_NAMES = {'scratch', 'builder', 'host', 'null', 'root', 'bridge', 'none', 'localhost', 'gateway', 'default'}
 
 def validate_project_name(name: str) -> Tuple[bool, str]:
     """Validate project name for safety in systemd, cron, filesystem, and Docker."""
@@ -846,6 +846,14 @@ def atomic_write(filepath: Path, content: str, backup: bool = True) -> bool:
             
             # Atomic rename
             os.rename(tmp_path, filepath)
+            
+            # FIX Issue 11: Sync directory to ensure rename is durable on power loss
+            dir_fd = os.open(str(filepath.parent), os.O_DIRECTORY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+            
             return True
             
         except Exception:
@@ -904,7 +912,7 @@ def safe_append_text(filepath: Path, content: str) -> bool:
         return False
 
 
-def safe_read_json(filepath: Path, default: Any = None, max_size: int = 50_000_000) -> Any:
+def safe_read_json(filepath: Path, default: Any = None, max_size: int = 10_000_000) -> Any:
     """
     Safely read JSON file with corruption recovery and size limit.
     
@@ -962,19 +970,51 @@ class CircuitBreaker:
     - CLOSED: normal operation
     - OPEN: failing, reject requests
     - HALF_OPEN: testing if recovered
+    
+    FIX Issue 7: Added state persistence to survive TUI restarts.
     """
     
     def __init__(self, name: str, failure_threshold: int = 3,
-                 recovery_timeout: float = 60.0, half_open_requests: int = 1):
+                 recovery_timeout: float = 60.0, half_open_requests: int = 1,
+                 state_dir: Path = None):
         self.name = name
         self.failure_threshold = failure_threshold
         self.recovery_timeout = recovery_timeout
         self.half_open_requests = half_open_requests
+        self.state_dir = state_dir
+        self.state_file = state_dir / f"circuit_{name}.json" if state_dir else None
         
-        self.failures = 0
-        self.successes_in_half_open = 0
-        self.state = "CLOSED"
-        self.last_failure_time = 0.0
+        # Load persisted state or use defaults
+        loaded = self._load_state()
+        self.failures = loaded.get('failures', 0)
+        self.successes_in_half_open = loaded.get('successes_in_half_open', 0)
+        self.state = loaded.get('state', "CLOSED")
+        self.last_failure_time = loaded.get('last_failure_time', 0.0)
+    
+    def _load_state(self) -> dict:
+        """Load persisted state from file."""
+        if not self.state_file or not self.state_file.exists():
+            return {}
+        try:
+            return json.loads(self.state_file.read_text())
+        except Exception:
+            return {}
+    
+    def _save_state(self):
+        """Persist state to file."""
+        if not self.state_file:
+            return
+        try:
+            self.state_file.parent.mkdir(parents=True, exist_ok=True)
+            state = {
+                'failures': self.failures,
+                'successes_in_half_open': self.successes_in_half_open,
+                'state': self.state,
+                'last_failure_time': self.last_failure_time
+            }
+            self.state_file.write_text(json.dumps(state))
+        except Exception:
+            pass  # Best effort
     
     def can_proceed(self) -> bool:
         """Check if request can proceed."""
@@ -988,6 +1028,7 @@ class CircuitBreaker:
             if time.time() - self.last_failure_time >= self.recovery_timeout:
                 self.state = "HALF_OPEN"
                 self.successes_in_half_open = 0
+                self._save_state()
                 log(f"Circuit {self.name}: OPEN -> HALF_OPEN (testing recovery)")
                 return True
             return False
@@ -1003,14 +1044,21 @@ class CircuitBreaker:
     
     def record_success(self):
         """Record successful call."""
+        state_changed = False
         if self.state == "HALF_OPEN":
             self.successes_in_half_open += 1
             if self.successes_in_half_open >= self.half_open_requests:
                 self.state = "CLOSED"
                 self.failures = 0
                 log(f"Circuit {self.name}: HALF_OPEN -> CLOSED (recovered)")
+                state_changed = True
         else:
+            if self.failures > 0:
+                state_changed = True
             self.failures = 0
+        
+        if state_changed:
+            self._save_state()
     
     def record_failure(self, error: str = ""):
         """Record failed call."""
@@ -1020,12 +1068,15 @@ class CircuitBreaker:
         if self.state == "HALF_OPEN":
             self.state = "OPEN"
             log(f"Circuit {self.name}: HALF_OPEN -> OPEN (still failing: {error[:100]})")
+            self._save_state()
             return
         
         self.failures += 1
         if self.failures >= self.failure_threshold:
             self.state = "OPEN"
             log(f"Circuit {self.name}: CLOSED -> OPEN (threshold reached: {error[:100]})")
+        
+        self._save_state()
     
     def get_state(self) -> dict:
         return {
@@ -1065,6 +1116,24 @@ class HealthMonitor:
         
         if ralph_dir:
             self.heartbeat_file = ralph_dir / ".heartbeat"
+            # FIX Issue 7: Enable circuit breaker persistence
+            state_dir = ralph_dir / "state"
+            state_dir.mkdir(parents=True, exist_ok=True)
+            self.docker_breaker.state_dir = state_dir
+            self.docker_breaker.state_file = state_dir / f"circuit_{self.docker_breaker.name}.json"
+            self.api_breaker.state_dir = state_dir
+            self.api_breaker.state_file = state_dir / f"circuit_{self.api_breaker.name}.json"
+            # Load persisted state
+            loaded = self.docker_breaker._load_state()
+            if loaded:
+                self.docker_breaker.failures = loaded.get('failures', 0)
+                self.docker_breaker.state = loaded.get('state', 'CLOSED')
+                self.docker_breaker.last_failure_time = loaded.get('last_failure_time', 0.0)
+            loaded = self.api_breaker._load_state()
+            if loaded:
+                self.api_breaker.failures = loaded.get('failures', 0)
+                self.api_breaker.state = loaded.get('state', 'CLOSED')
+                self.api_breaker.last_failure_time = loaded.get('last_failure_time', 0.0)
         
         self._stop_event.clear()
         self._thread = threading.Thread(target=self._monitor_loop, daemon=True)
@@ -1345,7 +1414,10 @@ class NotificationManager:
             chat_id = self.config["telegram_chat_id"]
             
             emoji = {"info": "ℹ️", "warning": "⚠️", "error": "❌", "critical": "🚨"}.get(level, "📢")
-            text = f"{emoji} *{title}*\n\n{message}"
+            # FIX: Escape markdown special chars in user content to prevent formatting issues
+            safe_title = title.replace('*', '\\*').replace('_', '\\_').replace('`', '\\`')
+            safe_message = message.replace('*', '\\*').replace('_', '\\_').replace('`', '\\`')
+            text = f"{emoji} *{safe_title}*\n\n{safe_message}"
             
             url = f"https://api.telegram.org/bot{token}/sendMessage"
             data = urllib.parse.urlencode({
@@ -2458,9 +2530,12 @@ class GitHandoff:
         
         try:
             # Write handoff file
-            safe_write_json(self.handoff_file, handoff)
+            # FIX Issue 14: Check return value before committing
+            if not safe_write_json(self.handoff_file, handoff):
+                log_error(f"Failed to write handoff file for {task_id}")
+                return False
             
-            # Commit it so next worker sees it
+            # Commit it so next worker sees it (only if write succeeded)
             self._commit_handoff(task_id, message)
             return True
         except Exception as e:
@@ -3064,10 +3139,26 @@ class TestEnforcement:
         
         created = 0
         
+        # FIX Issue 12: Use permanent error key index to prevent duplicates after cleanup
+        # This index persists even when FIX tasks are completed and removed
+        error_index = prd.get('_fix_error_index', {})
+        
         # Create FIX task only for UNIQUE code errors
         for error in code_errors[:3]:
             # Normalize error for comparison
             error_key = self._normalize_error(error)
+            
+            # Check permanent index first (persists after task cleanup)
+            if error_key in error_index:
+                existing_task_id = error_index[error_key]
+                # Check if task still exists
+                existing_task = next((s for s in stories if s.get('id') == existing_task_id), None)
+                if existing_task:
+                    # Task exists - if completed and error recurred, mark as not completed
+                    if existing_task.get('passes'):
+                        existing_task['passes'] = False
+                        existing_task['description'] += '\n\n[Previous fix attempt did not resolve the issue]'
+                continue  # Skip - already have/had a task for this error
             
             # Check ALL existing tasks (including completed!) for similar error
             is_duplicate = False
@@ -3096,7 +3187,14 @@ class TestEnforcement:
             error_hash = hashlib.sha256(error_key.encode()).hexdigest()[:12]
             task_id = f"FIX-{error_hash}"
             
-            # Check for hash collision by comparing full error_key
+            # Check for hash collision by comparing full error_key (in both index and stories)
+            if task_id in error_index.values():
+                # Collision with index - append counter
+                counter = 1
+                while f"{task_id}-{counter}" in error_index.values():
+                    counter += 1
+                task_id = f"{task_id}-{counter}"
+            
             for s in stories:
                 if s.get('id') == task_id:
                     # Collision detected - same ID but different error
@@ -3112,6 +3210,9 @@ class TestEnforcement:
             if any(s.get('id') == task_id for s in stories):
                 continue
             
+            # Store in permanent index before creating task
+            error_index[error_key] = task_id
+            
             prd.setdefault('userStories', []).append({
                 'id': task_id,
                 '_error_key': error_key,  # Store for collision detection
@@ -3123,6 +3224,9 @@ class TestEnforcement:
                 'type': 'fix'
             })
             created += 1
+        
+        # Save updated error index
+        prd['_fix_error_index'] = error_index
         
         if created > 0 or any(s.get('type') == 'fix' and not s.get('passes') for s in stories):
             prd['verified'] = False
@@ -3309,8 +3413,12 @@ class StuckDetector:
         
         return "\n".join(lines)
     
-    def _normalize_error(self, error: str) -> set:
-        """Normalize error text for better matching.
+    def _extract_error_keywords(self, error: str) -> set:
+        """Extract key terms from error for fuzzy matching.
+        
+        FIX Issue 13: Renamed from _normalize_error to avoid confusion with
+        TestEnforcement._normalize_error which returns a string.
+        This version returns a set for set intersection operations.
         
         Extracts key terms: error types, file names, function names.
         Removes noise: line numbers, timestamps, paths.
@@ -3354,8 +3462,8 @@ class StuckDetector:
         """
         history = self._load_history()
         
-        # Normalize current error
-        error_keywords = self._normalize_error(error_desc)
+        # Extract keywords from current error for fuzzy matching
+        error_keywords = self._extract_error_keywords(error_desc)
         similar_attempts = []
         
         for h in history:
@@ -3363,7 +3471,7 @@ class StuckDetector:
             if not task_id.startswith('FIX'):
                 continue
             attempt_error = h.get('error', '')
-            attempt_keywords = self._normalize_error(attempt_error)
+            attempt_keywords = self._extract_error_keywords(attempt_error)
             
             # Check overlap - at least 3 common keywords OR 30% overlap
             overlap = len(error_keywords & attempt_keywords)
@@ -4620,9 +4728,11 @@ def strip_ansi(text: str) -> str:
     - DCS/PM/APC/SOS sequences
     - Malformed sequences (missing ESC byte)
     """
-    # FIX: Return empty string for None/empty to match type hint (str, not Optional[str])
+    # FIX: Clearer None/empty string handling
+    if text is None:
+        return ""
     if not text:
-        return "" if text is None else text
+        return text  # Return empty string as-is
     text = text.replace('\r', '')
     # Standard CSI sequences
     text = re.sub(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])', '', text)
@@ -4635,6 +4745,27 @@ def strip_ansi(text: str) -> str:
     # Malformed sequences (missing ESC - common in redirected output)
     text = re.sub(r'\[[\d;]*[A-Za-z]', '', text)
     return text
+
+
+# FIX: Pre-compiled regex patterns for clean_openhands_output (performance optimization)
+_UI_NOISE_PATTERNS = [
+    re.compile(r'^Working \(\d+s.*$', re.IGNORECASE),
+    re.compile(r'^.*\| Type your message.*$', re.IGNORECASE),
+    re.compile(r'^\s*Ctrl.*$', re.IGNORECASE),
+    re.compile(r'^\s*ESC:.*$', re.IGNORECASE),
+    re.compile(r'^Tokens:.*$', re.IGNORECASE),
+    re.compile(r'^Cost:.*$', re.IGNORECASE),
+    re.compile(r'^cache \d+%.*$', re.IGNORECASE),
+    re.compile(r'^\d+K \• \$.*$', re.IGNORECASE),
+    re.compile(r'^─+$', re.IGNORECASE),
+    re.compile(r'^╭.*╮$', re.IGNORECASE),
+    re.compile(r'^╰.*╯$', re.IGNORECASE),
+    re.compile(r'^│\s*│$', re.IGNORECASE),
+    re.compile(r'^\s*\d+\s*$', re.IGNORECASE),  # Standalone numbers
+    re.compile(r'^M\s*$', re.IGNORECASE),  # Cursor artifact
+    re.compile(r'^\s+$', re.IGNORECASE),  # Whitespace only
+    re.compile(r'^Press.*to.*$', re.IGNORECASE),
+]
 
 
 def clean_openhands_output(text: str) -> str:
@@ -4665,26 +4796,7 @@ def clean_openhands_output(text: str) -> str:
     text = re.sub(r'[░▒▓█]+', '', text)
     text = re.sub(r'[\|/\-\\]{3,}', '', text)  # Spinner artifacts
     
-    # Step 4: Remove common OpenHands UI elements
-    ui_noise_patterns = [
-        r'^Working \(\d+s.*$',
-        r'^.*\| Type your message.*$',
-        r'^\s*Ctrl.*$',
-        r'^\s*ESC:.*$',
-        r'^Tokens:.*$',
-        r'^Cost:.*$',
-        r'^cache \d+%.*$',
-        r'^\d+K \• \$.*$',
-        r'^─+$',
-        r'^╭.*╮$',
-        r'^╰.*╯$',
-        r'^│\s*│$',
-        r'^\s*\d+\s*$',  # Standalone numbers
-        r'^M\s*$',  # Cursor artifact
-        r'^\s+$',  # Whitespace only
-        r'^Press.*to.*$',
-    ]
-    
+    # Step 4: Remove common OpenHands UI elements (use pre-compiled patterns)
     lines = text.split('\n')
     clean_lines = []
     prev_line = ""
@@ -4698,10 +4810,10 @@ def clean_openhands_output(text: str) -> str:
                 clean_lines.append('')
             continue
         
-        # Skip noise patterns
+        # Skip noise patterns (using pre-compiled regexes for performance)
         skip = False
-        for pattern in ui_noise_patterns:
-            if re.match(pattern, line, re.IGNORECASE):
+        for pattern in _UI_NOISE_PATTERNS:
+            if pattern.match(line):
                 skip = True
                 break
         if skip:
@@ -5100,12 +5212,20 @@ class Docker:
         except Exception:
             return []
     
+    # FIX: Timeout presets for common operations
+    TIMEOUT_QUICK = 10      # Simple checks (file exists, etc.)
+    TIMEOUT_NORMAL = 60     # Standard operations
+    TIMEOUT_INSTALL = 600   # Package installs, builds
+    
     @staticmethod
     def exec_in_container(name: str, command: str, timeout: int = 60) -> Tuple[int, str]:
         """Execute command in container.
         
         SECURITY WARNING: This method executes shell commands. For user-provided
         content, ALWAYS use write_file_safe() which base64-encodes content.
+        
+        Use timeout presets: Docker.TIMEOUT_QUICK (10s), Docker.TIMEOUT_NORMAL (60s),
+        Docker.TIMEOUT_INSTALL (600s) for appropriate operations.
         """
         try:
             result = subprocess.run(
@@ -8957,6 +9077,8 @@ You have access to QMD for semantic code search. Use when grep/find isn't enough
             
             # Save epoch summary for context
             summary_file = epoch_dir / f"epoch_{current_epoch:03d}_summary.md"
+            # FIX: Use readable variable instead of chr(10) for newlines in f-strings
+            task_list = '\n'.join(f"- {t}" for t in task_titles)
             summary_content = f"""# Epoch {current_epoch} Summary
 
 ## Milestone
@@ -8966,7 +9088,7 @@ You have access to QMD for semantic code search. Use when grep/find isn't enough
 - **Progress**: {done}/{total} tasks ({done*100//total if total > 0 else 0}%)
 
 ## Recent Completed Tasks
-{chr(10).join(f"- {t}" for t in task_titles)}
+{task_list}
 
 ## Key Learnings
 {self._extract_recent_learnings(500)}
@@ -9071,8 +9193,8 @@ You have access to QMD for semantic code search. Use when grep/find isn't enough
             
             # Calculate actual priority based on level
             if priority_level == "high":
-                # Insert before current tasks
-                priority = min_prio - 10 + i
+                # Insert before current tasks (FIX: clamp to 0 to avoid negative priorities)
+                priority = max(0, min_prio - 10 + i)
             elif priority_level == "low":
                 # Insert after all tasks
                 priority = max_prio + 100 + i

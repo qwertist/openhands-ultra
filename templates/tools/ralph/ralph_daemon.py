@@ -1383,9 +1383,9 @@ class DivergenceDetector:
                 return True, f"circular_pattern (avg_sim={avg_similarity:.2f})", "force_new_approach"
         
         # Check 2: Same outcome repeating
-        # FIX: Guard against empty list and falsy outcomes
-        outcomes = [o['outcome'] for o in outputs[-5:]]
-        if outcomes and outcomes[0]:  # Ensure list is non-empty and first element is truthy
+        # FIX: Filter out falsy/empty outcomes to prevent false positives
+        outcomes = [o['outcome'] for o in outputs[-5:] if o.get('outcome')]
+        if len(outcomes) >= 4:
             if outcomes.count(outcomes[0]) >= 4 and outcomes[0] not in ['task_done', 'verified_pass']:
                 return True, f"repeated_outcome ({outcomes[0]} x{outcomes.count(outcomes[0])})", "escalate_to_architect"
         
