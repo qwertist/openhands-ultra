@@ -1,4 +1,4 @@
-# 🤖 OpenHands Max
+# 🤖 OpenHands Ultra
 
 <div align="center">
 
@@ -17,8 +17,8 @@
 
 ```bash
 # Clone
-git clone https://github.com/qwertist/openhands-max.git
-cd openhands-max
+git clone https://github.com/qwertist/openhands-ultra.git
+cd openhands-ultra
 
 # Configure API keys
 cp .env.example .env
@@ -173,7 +173,7 @@ git reflog refs/ralph/tasks
 ## 📁 Project Structure
 
 ```
-openhands-max/
+openhands-ultra/
 ├── openhands.py              # Main TUI application
 ├── .env                      # API keys (create from .env.example)
 ├── .env.example              # Template for .env

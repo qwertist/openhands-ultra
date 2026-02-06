@@ -323,7 +323,7 @@ def first_run_setup(script_dir: Path, force: bool = False) -> bool:
             load_env_file(env_file)
         return True
     
-    print(f"\n{Colors.CYAN}🤖 OpenHands Max Setup{Colors.NC}")
+    print(f"\n{Colors.CYAN}🤖 OpenHands Ultra Setup{Colors.NC}")
     print("=" * 50)
     print()
     
