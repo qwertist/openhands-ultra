@@ -1894,7 +1894,18 @@ def mark_task_done(task_id: str, passed: bool = True):
     where another process could write between version check and save.
     
     File locking ensures atomic read-modify-write operations.
+    
+    HIGH-5 FIX: Also updates TaskManager when git state is available.
     """
+    # Update TaskManager first (git-native path)
+    if GIT_STATE_AVAILABLE and _task_manager:
+        status = "done" if passed else "failed"
+        if _task_manager.set_task_status(task_id, status):
+            log(f"Task {task_id} marked {status} in TaskManager")
+        else:
+            log_warning(f"Failed to update task {task_id} in TaskManager")
+    
+    # Also update legacy PRD for backward compatibility
     max_retries = 3
     for attempt in range(max_retries):
         try:

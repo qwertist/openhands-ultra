@@ -801,9 +801,30 @@ class TaskManager:
         if success and blob_content.strip():
             try:
                 data = json.loads(blob_content)
+                
+                # HIGH-1 FIX: Validate required structure
+                if not isinstance(data, dict):
+                    raise TaskFileCorruptedError("Tasks blob is not a dict")
+                if "tasks" not in data:
+                    raise TaskFileCorruptedError("Tasks blob missing 'tasks' key")
+                
                 for task_id, task_data in data.get("tasks", {}).items():
+                    # Validate required fields
+                    if not isinstance(task_data, dict):
+                        logger.warning(f"Task {task_id} is not a dict, skipping")
+                        continue
+                    if "title" not in task_data:
+                        logger.warning(f"Task {task_id} missing 'title', skipping")
+                        continue
+                    
                     task_data["id"] = task_id
+                    # Set defaults for optional fields
+                    task_data.setdefault("status", "pending")
+                    task_data.setdefault("description", "")
+                    task_data.setdefault("depends", [])
+                    
                     self._tasks[task_id] = Task.from_dict(task_data)
+                
                 logger.debug(f"Loaded {len(self._tasks)} tasks from git blob")
                 return
             except json.JSONDecodeError as e:
@@ -837,14 +858,25 @@ class TaskManager:
             data = json.loads(tasks_file.read_text())
             for task_id, task_data in data.get("tasks", {}).items():
                 task_data["id"] = task_id
+                # Set defaults for missing fields
+                task_data.setdefault("status", "pending")
+                task_data.setdefault("description", "")
+                task_data.setdefault("depends", [])
                 self._tasks[task_id] = Task.from_dict(task_data)
             
             # Save to git blob
-            if self._save():
-                # Backup and remove old file
-                backup = tasks_file.with_suffix('.json.migrated')
-                tasks_file.rename(backup)
-                logger.info(f"Migrated {len(self._tasks)} tasks, old file moved to {backup.name}")
+            if not self._save():
+                raise RuntimeError("Failed to save tasks to git blob")
+            
+            # HIGH-4 FIX: Verify save actually worked before deleting original
+            success, verify_content = self._run_git("show", self.TASKS_REF)
+            if not success or not verify_content.strip():
+                raise RuntimeError("Migration save verification failed - ref not readable")
+            
+            # Only then backup and remove old file
+            backup = tasks_file.with_suffix('.json.migrated')
+            tasks_file.rename(backup)
+            logger.info(f"Migrated {len(self._tasks)} tasks, old file moved to {backup.name}")
         except Exception as e:
             logger.error(f"Migration failed: {e}")
             raise
@@ -862,22 +894,37 @@ class TaskManager:
                 self._tasks[task.id] = task
             
             # Save to git blob
-            if self._save():
-                # Backup and remove old file
-                backup = prd_file.with_suffix('.json.migrated')
-                prd_file.rename(backup)
-                logger.info(f"Migrated {len(stories)} stories, old file moved to {backup.name}")
+            if not self._save():
+                raise RuntimeError("Failed to save tasks to git blob")
+            
+            # HIGH-4 FIX: Verify save actually worked before deleting original
+            success, verify_content = self._run_git("show", self.TASKS_REF)
+            if not success or not verify_content.strip():
+                raise RuntimeError("Migration save verification failed - ref not readable")
+            
+            # Only then backup and remove old file
+            backup = prd_file.with_suffix('.json.migrated')
+            prd_file.rename(backup)
+            logger.info(f"Migrated {len(stories)} stories, old file moved to {backup.name}")
         except Exception as e:
             logger.error(f"Migration failed: {e}")
             raise
     
-    def _save(self) -> bool:
-        """Save tasks to git blob atomically.
+    def _save(self, retry_count: int = 0) -> bool:
+        """Save tasks to git blob atomically with compare-and-swap.
         
         Creates a blob with JSON content and updates refs/ralph/tasks.
-        Race condition -> git reflog preserves both versions.
+        Uses CAS to detect concurrent modifications.
+        
+        HIGH-2 FIX: Compare-and-swap prevents lost updates from races.
         """
+        MAX_RETRIES = 3
+        
         try:
+            # Get current ref value for CAS
+            _, old_ref_output = self._run_git("show-ref", self.TASKS_REF)
+            old_hash = old_ref_output.split()[0] if old_ref_output.strip() else ""
+            
             data = {
                 "version": self.VERSION,
                 "project": self.project_prefix,
@@ -897,13 +944,27 @@ class TaskManager:
                 logger.error(f"Failed to create blob: {blob_hash}")
                 return False
             
-            # Update ref to point to blob
-            success, msg = self._run_git(
-                "update-ref", self.TASKS_REF, blob_hash
-            )
+            # Update ref with CAS (old_hash as expected value)
+            if old_hash:
+                # Existing ref - use CAS
+                success, msg = self._run_git(
+                    "update-ref", self.TASKS_REF, blob_hash, old_hash
+                )
+            else:
+                # New ref - just create it
+                success, msg = self._run_git(
+                    "update-ref", self.TASKS_REF, blob_hash
+                )
+            
             if not success:
-                logger.error(f"Failed to update ref: {msg}")
-                return False
+                if retry_count < MAX_RETRIES:
+                    logger.warning(f"Concurrent modification detected, retrying ({retry_count + 1}/{MAX_RETRIES})...")
+                    # Reload and merge
+                    self._load()
+                    return self._save(retry_count + 1)
+                else:
+                    logger.error(f"Failed to update ref after {MAX_RETRIES} retries: {msg}")
+                    return False
             
             logger.debug(f"Saved {len(self._tasks)} tasks to git blob {blob_hash[:8]}")
             return True
