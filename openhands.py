@@ -914,14 +914,15 @@ def safe_read_json(filepath: Path, default: Any = None, max_size: int = 50_000_0
                 log_error(f"File too large: {filepath} ({size} bytes, max {max_size})")
                 return default
             
-            content = filepath.read_text()
+            # FIX: Explicit UTF-8 encoding for cross-platform consistency
+            content = filepath.read_text(encoding='utf-8')
             return json.loads(content)
         except json.JSONDecodeError as e:
             log_error(f"JSON corruption in {filepath}: {e}")
             # Try backup
             if backup_path.exists():
                 try:
-                    content = backup_path.read_text()
+                    content = backup_path.read_text(encoding='utf-8')
                     data = json.loads(content)
                     log(f"Recovered {filepath} from backup")
                     # Restore from backup
@@ -4598,8 +4599,9 @@ def strip_ansi(text: str) -> str:
     - DCS/PM/APC/SOS sequences
     - Malformed sequences (missing ESC byte)
     """
+    # FIX: Return empty string for None/empty to match type hint (str, not Optional[str])
     if not text:
-        return text
+        return "" if text is None else text
     text = text.replace('\r', '')
     # Standard CSI sequences
     text = re.sub(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])', '', text)
