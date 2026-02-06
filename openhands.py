@@ -6055,9 +6055,11 @@ pgrep -f 'ralph_daemon.py' && echo 'STARTED' || echo 'FAILED'
     @staticmethod
     def read_file(container: str, path: str) -> Optional[str]:
         """Read file content from container. Returns None if file doesn't exist."""
+        # SECURITY FIX: Use shlex.quote for path
+        quoted_path = shlex.quote(path)
         code, output = Docker.exec_in_container(
             container,
-            f"cat '{path}' 2>/dev/null",
+            f"cat {quoted_path} 2>/dev/null",
             timeout=5
         )
         return output if code == 0 else None
@@ -6066,10 +6068,12 @@ pgrep -f 'ralph_daemon.py' && echo 'STARTED' || echo 'FAILED'
     def write_file(container: str, path: str, content: str) -> bool:
         """Write content to file in container."""
         # Use base64 to safely transfer content with special chars
+        # SECURITY FIX: Use shlex.quote for path to prevent injection
         encoded = base64.b64encode(content.encode()).decode()
+        quoted_path = shlex.quote(path)
         code, _ = Docker.exec_in_container(
             container,
-            f"echo '{encoded}' | base64 -d > '{path}'",
+            f"echo '{encoded}' | base64 -d > {quoted_path}",
             timeout=10
         )
         return code == 0
@@ -6077,9 +6081,11 @@ pgrep -f 'ralph_daemon.py' && echo 'STARTED' || echo 'FAILED'
     @staticmethod
     def file_exists(container: str, path: str) -> bool:
         """Check if file exists in container."""
+        # SECURITY FIX: Use shlex.quote for path
+        quoted_path = shlex.quote(path)
         code, _ = Docker.exec_in_container(
             container,
-            f"test -f '{path}'",
+            f"test -f {quoted_path}",
             timeout=5
         )
         return code == 0
@@ -6097,9 +6103,11 @@ pgrep -f 'ralph_daemon.py' && echo 'STARTED' || echo 'FAILED'
     @staticmethod
     def mkdir(container: str, path: str) -> bool:
         """Create directory in container."""
+        # SECURITY FIX: Use shlex.quote for path
+        quoted_path = shlex.quote(path)
         code, _ = Docker.exec_in_container(
             container,
-            f"mkdir -p '{path}'",
+            f"mkdir -p {quoted_path}",
             timeout=5
         )
         return code == 0
@@ -6132,9 +6140,12 @@ pgrep -f 'ralph_daemon.py' && echo 'STARTED' || echo 'FAILED'
         # SECURITY FIX: Use UUID for unique temp name instead of PID
         # This prevents race conditions across different PID namespaces
         tmp_path = f"{path}.tmp.{uuid.uuid4().hex[:8]}"
+        # SECURITY FIX: Use shlex.quote for paths
+        quoted_tmp = shlex.quote(tmp_path)
+        quoted_path = shlex.quote(path)
         code, _ = Docker.exec_in_container(
             container,
-            f"echo '{encoded}' | base64 -d > '{tmp_path}' && mv '{tmp_path}' '{path}'",
+            f"echo '{encoded}' | base64 -d > {quoted_tmp} && mv {quoted_tmp} {quoted_path}",
             timeout=10
         )
         return code == 0
@@ -6142,10 +6153,12 @@ pgrep -f 'ralph_daemon.py' && echo 'STARTED' || echo 'FAILED'
     @staticmethod
     def append_file(container: str, path: str, content: str) -> bool:
         """Append content to file in container."""
+        # SECURITY FIX: Use shlex.quote for path
         encoded = base64.b64encode(content.encode()).decode()
+        quoted_path = shlex.quote(path)
         code, _ = Docker.exec_in_container(
             container,
-            f"echo '{encoded}' | base64 -d >> '{path}'",
+            f"echo '{encoded}' | base64 -d >> {quoted_path}",
             timeout=10
         )
         return code == 0
