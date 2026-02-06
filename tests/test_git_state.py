@@ -69,14 +69,14 @@ def git_state(temp_git_repo):
 def task_manager(temp_git_repo):
     """Create TaskManager instance."""
     workspace, ralph_dir = temp_git_repo
-    return TaskManager(ralph_dir, "ts")
+    return TaskManager(workspace, "ts", ralph_dir)
 
 
 @pytest.fixture
 def formula_manager(temp_git_repo):
     """Create FormulaManager instance."""
     workspace, ralph_dir = temp_git_repo
-    return FormulaManager(ralph_dir)
+    return FormulaManager(workspace, ralph_dir)
 
 
 # =============================================================================
@@ -426,12 +426,12 @@ class TestTaskManager:
         workspace, ralph_dir = temp_git_repo
         
         # Create tasks
-        tm1 = TaskManager(ralph_dir, "ts")
+        tm1 = TaskManager(workspace, "ts", ralph_dir)
         task = tm1.create_task("Persistent task")
         task_id = task.id
         
-        # New instance should see tasks
-        tm2 = TaskManager(ralph_dir, "ts")
+        # New instance should see tasks (from git blob)
+        tm2 = TaskManager(workspace, "ts", ralph_dir)
         loaded = tm2.get_task(task_id)
         
         assert loaded is not None
@@ -543,8 +543,8 @@ class TestIntegration:
         workspace, ralph_dir = temp_git_repo
         
         git_state = GitStateManager(workspace)
-        task_manager = TaskManager(ralph_dir, "test")
-        formula_manager = FormulaManager(ralph_dir)
+        task_manager = TaskManager(workspace, "test", ralph_dir)
+        formula_manager = FormulaManager(workspace, ralph_dir)
         
         # Create formulas
         formula_manager.create_builtin_formulas()

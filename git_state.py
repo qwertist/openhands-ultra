@@ -725,83 +725,157 @@ class GitStateManager:
 
 
 # =============================================================================
-# TASK MANAGER (tasks.json with bead-style IDs)
+# TASK MANAGER (Git-Native with bead-style IDs)
 # =============================================================================
 
 class TaskManager:
     """
     Manages tasks with bead-style IDs.
     
-    Tasks stored in .ralph/tasks.json (git-tracked).
-    Replaces old prd.json with userStories.
+    v5.1: Tasks stored in git blob via refs/ralph/tasks (NO FILE).
+    Replaces old prd.json and tasks.json with pure git storage.
+    
+    Storage:
+        refs/ralph/tasks -> blob containing JSON
+        
+    History:
+        git reflog refs/ralph/tasks  # See all changes
+        
+    Benefits:
+        - No file race conditions (git handles locking)
+        - Full history via reflog
+        - Atomic updates
+        - Crash-safe
     """
     
-    VERSION = 2  # Task format version
+    VERSION = 3  # Task format version (v3 = git-native)
+    TASKS_REF = "refs/ralph/tasks"
     
-    def __init__(self, ralph_dir: Path, project_prefix: str = "oh"):
-        self.ralph_dir = Path(ralph_dir)
-        self.tasks_file = self.ralph_dir / "tasks.json"
+    def __init__(self, workspace: Path, project_prefix: str = "oh", 
+                 ralph_dir: Optional[Path] = None):
+        """
+        Args:
+            workspace: Git repository root (contains .git/)
+            project_prefix: Prefix for task IDs (e.g., "oh" -> "oh-k7m2x")
+            ralph_dir: Optional .ralph/ dir for migration (can be None after migration)
+        """
+        self.workspace = Path(workspace)
+        self.ralph_dir = Path(ralph_dir) if ralph_dir else self.workspace / ".ralph"
         self.project_prefix = project_prefix
         self._tasks: Dict[str, Task] = {}
+        
+        # Validate git repo exists
+        if not (self.workspace / ".git").exists():
+            raise ValueError(f"Not a git repository: {self.workspace}")
+        
         self._load()
     
-    def _load(self):
-        """Load tasks from file.
-        
-        Raises TaskFileCorruptedError if the file exists but is corrupted,
-        to prevent silent data loss.
-        """
-        if not self.tasks_file.exists():
-            self._tasks = {}
-            return
-        
+    def _run_git(self, *args, input_data: str = None) -> Tuple[bool, str]:
+        """Run git command, return (success, output)."""
+        cmd = ["git"] + list(args)
         try:
-            content = self.tasks_file.read_text()
-            if not content.strip():
-                # Empty file is OK
-                self._tasks = {}
-                return
-            
-            data = json.loads(content)
-            version = data.get("version", 1)
-            
-            if version == 1:
-                # Old prd.json format with userStories
-                self._migrate_from_v1(data)
-            else:
-                # New format
+            result = subprocess.run(
+                cmd,
+                cwd=self.workspace,
+                capture_output=True,
+                text=True,
+                input=input_data,
+                timeout=30
+            )
+            return result.returncode == 0, result.stdout.strip()
+        except Exception as e:
+            logger.error(f"Git command failed: {cmd}: {e}")
+            return False, str(e)
+    
+    def _load(self):
+        """Load tasks from git blob.
+        
+        Tries in order:
+        1. Git blob at refs/ralph/tasks (v3 format)
+        2. File .ralph/tasks.json (v2 format) -> migrate
+        3. File .ralph/prd.json (v1 format) -> migrate
+        4. Empty (new project)
+        """
+        # Try git blob first
+        success, blob_content = self._run_git("show", self.TASKS_REF)
+        if success and blob_content.strip():
+            try:
+                data = json.loads(blob_content)
                 for task_id, task_data in data.get("tasks", {}).items():
                     task_data["id"] = task_id
                     self._tasks[task_id] = Task.from_dict(task_data)
-                    
-        except json.JSONDecodeError as e:
-            # Corrupted JSON - don't silently discard!
-            logger.error(f"Corrupted tasks file: {e}")
-            raise TaskFileCorruptedError(
-                f"Tasks file corrupted: {self.tasks_file}. "
-                f"Backup and recreate, or fix the JSON manually."
-            ) from e
+                logger.debug(f"Loaded {len(self._tasks)} tasks from git blob")
+                return
+            except json.JSONDecodeError as e:
+                logger.error(f"Corrupted tasks blob: {e}")
+                raise TaskFileCorruptedError(
+                    f"Tasks blob corrupted at {self.TASKS_REF}. "
+                    f"Check git reflog refs/ralph/tasks for history."
+                ) from e
+        
+        # Try file-based migration (v2 tasks.json)
+        tasks_file = self.ralph_dir / "tasks.json"
+        if tasks_file.exists():
+            self._migrate_from_file(tasks_file)
+            return
+        
+        # Try file-based migration (v1 prd.json)
+        prd_file = self.ralph_dir / "prd.json"
+        if prd_file.exists():
+            self._migrate_from_prd(prd_file)
+            return
+        
+        # New project - empty tasks
+        self._tasks = {}
+        logger.debug("No existing tasks found, starting fresh")
+    
+    def _migrate_from_file(self, tasks_file: Path):
+        """Migrate from tasks.json (v2) to git blob (v3)."""
+        logger.info(f"Migrating tasks from {tasks_file} to git blob")
+        
+        try:
+            data = json.loads(tasks_file.read_text())
+            for task_id, task_data in data.get("tasks", {}).items():
+                task_data["id"] = task_id
+                self._tasks[task_id] = Task.from_dict(task_data)
+            
+            # Save to git blob
+            if self._save():
+                # Backup and remove old file
+                backup = tasks_file.with_suffix('.json.migrated')
+                tasks_file.rename(backup)
+                logger.info(f"Migrated {len(self._tasks)} tasks, old file moved to {backup.name}")
         except Exception as e:
-            logger.error(f"Failed to load tasks: {e}")
+            logger.error(f"Migration failed: {e}")
             raise
     
-    def _migrate_from_v1(self, data: dict):
-        """Migrate from old prd.json format."""
-        logger.info("Migrating from prd.json v1 to tasks.json v2")
+    def _migrate_from_prd(self, prd_file: Path):
+        """Migrate from prd.json (v1) to git blob (v3)."""
+        logger.info(f"Migrating from prd.json to git blob")
         
-        stories = data.get("userStories", [])
-        for story in stories:
-            task = Task.from_user_story(story, self.project_prefix)
-            self._tasks[task.id] = task
-        
-        # Save in new format
-        self._save()
-        logger.info(f"Migrated {len(stories)} user stories to tasks")
+        try:
+            data = json.loads(prd_file.read_text())
+            stories = data.get("userStories", [])
+            
+            for story in stories:
+                task = Task.from_user_story(story, self.project_prefix)
+                self._tasks[task.id] = task
+            
+            # Save to git blob
+            if self._save():
+                # Backup and remove old file
+                backup = prd_file.with_suffix('.json.migrated')
+                prd_file.rename(backup)
+                logger.info(f"Migrated {len(stories)} stories, old file moved to {backup.name}")
+        except Exception as e:
+            logger.error(f"Migration failed: {e}")
+            raise
     
     def _save(self) -> bool:
-        """Save tasks to file atomically.
+        """Save tasks to git blob atomically.
         
-        Uses write-to-temp-then-rename pattern for crash safety.
+        Creates a blob with JSON content and updates refs/ralph/tasks.
+        Race condition -> git reflog preserves both versions.
         """
         try:
             data = {
@@ -812,27 +886,28 @@ class TaskManager:
                 "updated": datetime.now().isoformat()
             }
             
-            self.ralph_dir.mkdir(parents=True, exist_ok=True)
+            json_content = json.dumps(data, indent=2)
             
-            # Atomic write: write to temp file, then rename
-            fd, temp_path = tempfile.mkstemp(
-                dir=self.ralph_dir,
-                prefix='.tasks_',
-                suffix='.json'
+            # Create blob: echo content | git hash-object -w --stdin
+            success, blob_hash = self._run_git(
+                "hash-object", "-w", "--stdin",
+                input_data=json_content
             )
-            try:
-                with os.fdopen(fd, 'w') as f:
-                    json.dump(data, f, indent=2)
-                os.rename(temp_path, self.tasks_file)
-            except Exception:
-                # Clean up temp file on error
-                try:
-                    os.unlink(temp_path)
-                except OSError:
-                    pass
-                raise
+            if not success:
+                logger.error(f"Failed to create blob: {blob_hash}")
+                return False
             
+            # Update ref to point to blob
+            success, msg = self._run_git(
+                "update-ref", self.TASKS_REF, blob_hash
+            )
+            if not success:
+                logger.error(f"Failed to update ref: {msg}")
+                return False
+            
+            logger.debug(f"Saved {len(self._tasks)} tasks to git blob {blob_hash[:8]}")
             return True
+            
         except Exception as e:
             logger.error(f"Failed to save tasks: {e}")
             return False
@@ -1117,12 +1192,43 @@ class FormulaManager:
     Manages TOML workflow formulas.
     
     Formulas define reusable task sequences.
+    
+    v5.1: Formulas now in workspace/formulas/ (visible, editable)
+    instead of .ralph/formulas/ (hidden).
     """
     
-    def __init__(self, ralph_dir: Path):
-        self.ralph_dir = Path(ralph_dir)
-        self.formulas_dir = self.ralph_dir / "formulas"
+    def __init__(self, workspace: Path, ralph_dir: Optional[Path] = None):
+        """
+        Args:
+            workspace: Git repository root
+            ralph_dir: Optional .ralph/ dir for migration
+        """
+        self.workspace = Path(workspace)
+        self.ralph_dir = Path(ralph_dir) if ralph_dir else self.workspace / ".ralph"
+        
+        # New location: workspace/formulas/ (visible)
+        self.formulas_dir = self.workspace / "formulas"
         self.formulas_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Migrate from old location if exists
+        old_formulas_dir = self.ralph_dir / "formulas"
+        if old_formulas_dir.exists() and old_formulas_dir.is_dir():
+            self._migrate_formulas(old_formulas_dir)
+    
+    def _migrate_formulas(self, old_dir: Path):
+        """Migrate formulas from .ralph/formulas/ to workspace/formulas/."""
+        import shutil
+        migrated = 0
+        for f in old_dir.glob("*.toml"):
+            dest = self.formulas_dir / f.name
+            if not dest.exists():
+                shutil.copy(f, dest)
+                migrated += 1
+        
+        if migrated > 0:
+            logger.info(f"Migrated {migrated} formulas from {old_dir} to {self.formulas_dir}")
+            # Rename old directory to mark as migrated
+            old_dir.rename(old_dir.with_suffix('.migrated'))
     
     def list_formulas(self) -> List[str]:
         """List available formula names."""
