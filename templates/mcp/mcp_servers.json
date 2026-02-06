@@ -1,0 +1,35 @@
+{
+  "mcpServers": {
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/workspace"]
+    },
+    "fetch": {
+      "command": "uvx",
+      "args": ["mcp-server-fetch"]
+    },
+    "memory": {
+      "command": "uvx",
+      "args": ["--from", "mcp-memory-service", "mcp-memory-server"],
+      "env": {
+        "MCP_MEMORY_STORAGE_BACKEND": "sqlite_vec",
+        "MCP_MEMORY_CHROMA_PATH": "/workspace/.memory"
+      }
+    },
+    "context7": {
+      "command": "npx",
+      "args": ["-y", "@upstash/context7-mcp@latest"]
+    },
+    "git": {
+      "command": "uvx",
+      "args": ["mcp-server-git", "--repository", "/workspace"]
+    },
+    "tavily": {
+      "command": "npx",
+      "args": ["-y", "tavily-mcp@latest"],
+      "env": {
+        "TAVILY_API_KEY": "${TAVILY_API_KEY}"
+      }
+    }
+  }
+}
