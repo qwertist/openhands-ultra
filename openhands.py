@@ -3007,10 +3007,15 @@ class TestEnforcement:
         
         stories = prd.get('userStories', [])
         
-        # Count existing FIX tasks (both pending and done) - limit total
-        existing_fix_count = sum(1 for s in stories if s.get('type') == 'fix')
-        if existing_fix_count >= 10:
-            # Too many FIX tasks already - likely a systemic issue
+        # FIX: Count only PENDING fix tasks, not completed ones
+        # Previously counted all fix tasks including completed, which blocked
+        # new fixes after 10 total historical fix tasks
+        pending_fix_count = sum(1 for s in stories 
+                                if s.get('type') == 'fix' 
+                                and not s.get('passes', False)
+                                and not s.get('blocked', False))
+        if pending_fix_count >= 10:
+            # Too many pending FIX tasks - likely a systemic issue
             # Don't create more, let architect handle it
             return 0
         
@@ -4506,8 +4511,10 @@ Be THOROUGH. Missing information = lost forever.
         if metrics:
             metrics.record_condense(facts_preserved=preserved, facts_total=total)
         
-        # Valid if >70% facts preserved
-        is_valid = (preserved / total) >= 0.7 if total > 0 else True
+        # FIX: Increased threshold from 70% to 85%
+        # 70% was too permissive - 30% of critical errors could be lost
+        # 85% ensures most important facts are preserved
+        is_valid = (preserved / total) >= 0.85 if total > 0 else True
         
         return is_valid, missing
     

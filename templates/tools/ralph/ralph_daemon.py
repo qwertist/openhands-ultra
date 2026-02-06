@@ -31,7 +31,7 @@ import traceback
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional, Tuple, List, Dict, Any, Set
-from collections import deque
+from collections import deque, OrderedDict
 
 
 # =============================================================================
@@ -254,27 +254,32 @@ def signal_handler(signum, frame):
     """Handle SIGTERM/SIGINT for graceful shutdown.
     
     FIX: Use lock to safely access current_process from signal handler.
+    FIX: Don't wait in signal handler - just terminate and let main loop handle cleanup.
+    This prevents potential deadlock if main thread is also waiting on the process.
     """
     global shutdown_requested, current_process, _process_lock
     log(f"Received signal {signum}, shutting down...")
     shutdown_requested = True
     
-    # Safely get process reference with lock
+    # Safely get and clear process reference with lock
     proc = None
     if _process_lock:
         with _process_lock:
             proc = current_process
+            current_process = None  # Mark as "being handled"
     else:
         proc = current_process
+        current_process = None
     
-    if proc and proc.poll() is None:
-        log("Terminating current iteration...")
-        proc.terminate()
+    if proc:
         try:
-            proc.wait(timeout=15)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
+            # Non-blocking terminate - main loop will handle cleanup
+            if proc.poll() is None:
+                log("Terminating current iteration...")
+                proc.terminate()
+                # Don't wait here - main loop will detect shutdown_requested
+        except Exception:
+            pass
 
 
 def write_heartbeat():
@@ -324,9 +329,41 @@ def save_config(config: dict):
 
 
 def update_config(key: str, value):
-    config = read_config()
-    config[key] = value
-    save_config(config)
+    """Update config with file locking to prevent race conditions.
+    
+    FIX: Uses fcntl.flock for atomic read-modify-write, same pattern as mark_task_done().
+    This prevents concurrent updates (e.g., TUI + daemon) from losing changes.
+    """
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            # Ensure file exists
+            if not CONFIG_FILE.exists():
+                config = {"status": "paused", "currentIteration": 0}
+                config[key] = value
+                save_config(config)
+                return
+            
+            with open(CONFIG_FILE, 'r+') as f:
+                fcntl.flock(f, fcntl.LOCK_EX)
+                try:
+                    content = f.read()
+                    config = json.loads(content) if content.strip() else {"status": "paused", "currentIteration": 0}
+                    config[key] = value
+                    
+                    f.seek(0)
+                    f.truncate()
+                    json.dump(config, f, indent=2, ensure_ascii=False)
+                    f.flush()
+                    os.fsync(f.fileno())
+                finally:
+                    fcntl.flock(f, fcntl.LOCK_UN)
+                return
+        except (IOError, OSError, json.JSONDecodeError) as e:
+            log_warning(f"Config update failed, retrying ({attempt+1}/{max_retries}): {e}")
+            time.sleep(0.1 * (attempt + 1))
+    
+    log_error(f"Failed to update config key '{key}' after {max_retries} retries")
 
 
 def read_prd() -> dict:
@@ -343,15 +380,18 @@ def save_prd(prd: dict):
 # =============================================================================
 
 class SemanticSearch:
-    """Semantic search with LRU cache and batch operations."""
+    """Semantic search with LRU cache and batch operations.
+    
+    FIX: Uses OrderedDict for O(1) LRU operations instead of deque which had O(n) remove().
+    """
     
     _model = None
     _model_loaded = False
     
     def __init__(self):
         self.cache_file = RALPH_DIR / "semantic_cache.json"
-        self._embeddings_cache = {}
-        self._cache_access_order = deque(maxlen=MAX_SEMANTIC_CACHE)
+        # FIX: Use OrderedDict for O(1) move_to_end() instead of deque.remove() which is O(n)
+        self._embeddings_cache: OrderedDict = OrderedDict()
         self._load_cache()
     
     @classmethod
@@ -371,24 +411,22 @@ class SemanticSearch:
         return cls._model
     
     def _load_cache(self):
+        """Load cache from disk into OrderedDict (preserves LRU order)."""
         if self.cache_file.exists():
             try:
                 data = json.loads(self.cache_file.read_text())
-                # Load only recent entries
+                # Load only recent entries, preserving order
                 keys = list(data.keys())[-MAX_SEMANTIC_CACHE:]
-                self._embeddings_cache = {k: data[k] for k in keys}
-                self._cache_access_order = deque(keys, maxlen=MAX_SEMANTIC_CACHE)
+                self._embeddings_cache = OrderedDict((k, data[k]) for k in keys)
             except Exception:
-                self._embeddings_cache = {}
+                self._embeddings_cache = OrderedDict()
     
     def _save_cache(self):
+        """Save cache to disk (OrderedDict preserves LRU order naturally)."""
         try:
-            # Save only entries in access order
-            to_save = {k: self._embeddings_cache[k] 
-                      for k in self._cache_access_order 
-                      if k in self._embeddings_cache}
-            self.cache_file.write_text(json.dumps(to_save))
-            os.chmod(self.cache_file, 0o666)
+            # OrderedDict preserves insertion order, just save directly
+            self.cache_file.write_text(json.dumps(dict(self._embeddings_cache)))
+            os.chmod(self.cache_file, 0o644)
         except Exception:
             pass
     
@@ -396,29 +434,28 @@ class SemanticSearch:
         return hashlib.md5(text.encode()).hexdigest()[:16]
     
     def _get_embedding(self, text: str):
-        """Get embedding with LRU cache."""
+        """Get embedding with O(1) LRU cache using OrderedDict.
+        
+        FIX: Uses OrderedDict.move_to_end() which is O(1) instead of
+        deque.remove() which was O(n). With 8000 cache entries this is significant.
+        """
         import numpy as np
         model = self._get_model()
         
         text_hash = self._text_hash(text)
         
         if text_hash in self._embeddings_cache:
-            # Move to end (most recently used)
-            if text_hash in self._cache_access_order:
-                self._cache_access_order.remove(text_hash)
-            self._cache_access_order.append(text_hash)
+            # O(1) move to end (most recently used)
+            self._embeddings_cache.move_to_end(text_hash)
             return np.array(self._embeddings_cache[text_hash], dtype=np.float32)
+        
+        # Evict oldest entries if at limit (O(1) per eviction)
+        while len(self._embeddings_cache) >= MAX_SEMANTIC_CACHE:
+            self._embeddings_cache.popitem(last=False)  # Remove oldest
         
         # Compute new embedding
         embedding = model.encode(text, convert_to_numpy=True)
-        
-        # LRU eviction
-        if len(self._embeddings_cache) >= MAX_SEMANTIC_CACHE:
-            oldest = self._cache_access_order.popleft()
-            self._embeddings_cache.pop(oldest, None)
-        
         self._embeddings_cache[text_hash] = embedding.tolist()
-        self._cache_access_order.append(text_hash)
         
         return embedding.astype(np.float32)
     
@@ -1313,7 +1350,11 @@ class DiskSpaceMonitor:
         return self.get_free_mb() < 500
     
     def cleanup(self, emergency: bool = False):
-        """Clean up old files."""
+        """Clean up old files.
+        
+        FIX: Uses modification time for sorting and protects files newer than 1 hour.
+        This prevents deleting files from the current iteration batch.
+        """
         stats = {"deleted": 0, "truncated": 0}
         
         # Truncate log
@@ -1328,17 +1369,26 @@ class DiskSpaceMonitor:
         
         # Delete old iteration logs
         keep = 100 if emergency else MAX_ITERATION_LOGS
+        cutoff_time = time.time() - 3600  # 1 hour ago
+        
         if ITERATIONS_DIR.exists():
-            for old in sorted(ITERATIONS_DIR.glob("*.log"))[:-keep]:
+            # Sort by modification time (oldest first), not alphabetically
+            log_files = sorted(ITERATIONS_DIR.glob("*.log"), key=lambda p: p.stat().st_mtime)
+            for old in log_files[:-keep]:
                 try:
-                    old.unlink()
-                    stats["deleted"] += 1
+                    # FIX: Don't delete files newer than 1 hour
+                    if old.stat().st_mtime < cutoff_time:
+                        old.unlink()
+                        stats["deleted"] += 1
                 except Exception:
                     pass
-            for old in sorted(ITERATIONS_DIR.glob("*.json"))[:-keep]:
+            
+            json_files = sorted(ITERATIONS_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime)
+            for old in json_files[:-keep]:
                 try:
-                    old.unlink()
-                    stats["deleted"] += 1
+                    if old.stat().st_mtime < cutoff_time:
+                        old.unlink()
+                        stats["deleted"] += 1
                 except Exception:
                     pass
         
@@ -1351,15 +1401,43 @@ class DiskSpaceMonitor:
 # =============================================================================
 
 class CircuitBreaker:
-    """Circuit breaker for external services."""
+    """Circuit breaker for external services.
+    
+    FIX: State is now persisted to survive daemon restarts.
+    This prevents crash-loop bypass where failures reset on restart.
+    """
     
     def __init__(self, name: str, threshold: int = 5, timeout: float = 120.0):
         self.name = name
         self.threshold = threshold
         self.timeout = timeout
-        self.failures = 0
-        self.state = "CLOSED"
-        self.last_failure = 0.0
+        self.state_file = RALPH_DIR / f"circuit_{name}.json"
+        
+        # Load persisted state
+        state = self._load_state()
+        self.failures = state.get('failures', 0)
+        self.state = state.get('state', 'CLOSED')
+        self.last_failure = state.get('last_failure', 0.0)
+    
+    def _load_state(self) -> dict:
+        """Load circuit breaker state from disk."""
+        if self.state_file.exists():
+            try:
+                return json.loads(self.state_file.read_text())
+            except Exception:
+                pass
+        return {}
+    
+    def _save_state(self):
+        """Persist circuit breaker state to disk."""
+        try:
+            atomic_write_json(self.state_file, {
+                'failures': self.failures,
+                'state': self.state,
+                'last_failure': self.last_failure
+            })
+        except Exception:
+            pass
     
     def can_proceed(self) -> bool:
         if self.state == "CLOSED":
@@ -1367,6 +1445,7 @@ class CircuitBreaker:
         if self.state == "OPEN":
             if time.time() - self.last_failure >= self.timeout:
                 self.state = "HALF_OPEN"
+                self._save_state()
                 return True
             return False
         return True
@@ -1376,6 +1455,7 @@ class CircuitBreaker:
             self.state = "CLOSED"
             log(f"Circuit {self.name}: recovered")
         self.failures = 0
+        self._save_state()
     
     def record_failure(self):
         self.failures += 1
@@ -1383,6 +1463,7 @@ class CircuitBreaker:
         if self.failures >= self.threshold:
             self.state = "OPEN"
             log(f"Circuit {self.name}: OPEN")
+        self._save_state()
 
 
 # =============================================================================
@@ -1635,8 +1716,10 @@ def get_iteration_type(config: dict) -> str:
         return "condense"
     
     # Architect interval
+    # FIX: Track last architect iteration to prevent duplicate on resume
     arch_interval = config.get("architectInterval", 10)
-    if arch_interval > 0 and iteration > 0 and iteration % arch_interval == 0:
+    last_architect = config.get("lastArchitectIteration", 0)
+    if arch_interval > 0 and iteration > 0 and iteration > last_architect and iteration % arch_interval == 0:
         return "architect"
     
     # All done?
@@ -1821,6 +1904,9 @@ def handle_iteration_result(iteration: int, iter_type: str, output: str, config:
             result = "verification_pending"
     
     elif iter_type == "architect":
+        # FIX: Track last architect iteration to prevent duplicate on resume
+        iteration = config.get("currentIteration", 0)
+        update_config("lastArchitectIteration", iteration)
         result = "architect_done"
     
     elif iter_type == "condense":
@@ -1843,11 +1929,16 @@ def handle_iteration_result(iteration: int, iter_type: str, output: str, config:
 
 
 def run_iteration(config: dict) -> Tuple[bool, str]:
-    """Run single iteration."""
+    """Run single iteration.
+    
+    FIX: Iteration counter is now incremented AFTER successful completion,
+    not at the start. This prevents skipped iterations if daemon crashes mid-iteration.
+    """
     global current_process
     
+    # Calculate next iteration but don't persist yet
     iteration = config.get("currentIteration", 0) + 1
-    update_config("currentIteration", iteration)
+    # NOTE: We'll persist this AFTER successful completion (see end of function)
     
     if circuit_breaker and not circuit_breaker.can_proceed():
         log_warning("Circuit breaker OPEN")
@@ -1988,6 +2079,10 @@ def run_iteration(config: dict) -> Tuple[bool, str]:
             milestone = epochs.check_milestone(iteration)
             if milestone:
                 epochs.save_epoch(iteration, milestone)
+        
+        # FIX: Only increment counter AFTER successful completion
+        # This prevents lost iterations if daemon crashes mid-iteration
+        update_config("currentIteration", iteration)
         
         log(f"Iteration {iteration}: {result} ({int(elapsed)}s)")
         return True, result
