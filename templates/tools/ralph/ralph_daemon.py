@@ -70,6 +70,49 @@ def install_dependencies():
 install_dependencies()
 
 # =============================================================================
+# VERSION
+# =============================================================================
+
+DAEMON_VERSION = "3.0.0"  # Git-native state management
+
+# =============================================================================
+# GIT STATE INTEGRATION (v5.0)
+# =============================================================================
+
+# Try to import git_state module (created by openhands.py v5.0)
+GIT_STATE_AVAILABLE = False
+_git_state_manager = None
+_task_manager = None
+
+def _init_git_state():
+    """Initialize git state managers if available."""
+    global GIT_STATE_AVAILABLE, _git_state_manager, _task_manager
+    
+    try:
+        # Add parent directory to path for imports
+        import sys
+        parent_dir = str(Path(__file__).parent.parent.parent.parent)
+        if parent_dir not in sys.path:
+            sys.path.insert(0, parent_dir)
+        
+        from git_state import GitStateManager, TaskManager
+        
+        workspace = Path("/workspace").resolve()
+        _git_state_manager = GitStateManager(workspace)
+        _task_manager = TaskManager(RALPH_DIR)
+        GIT_STATE_AVAILABLE = True
+        print(f"[Ralph] Git-native state enabled (daemon v{DAEMON_VERSION})")
+    except Exception as e:
+        print(f"[Ralph] Git state not available: {e}")
+        GIT_STATE_AVAILABLE = False
+
+# Initialize on module load
+try:
+    _init_git_state()
+except Exception:
+    pass
+
+# =============================================================================
 # CONSTANTS - Optimized for 250K+ context models
 # =============================================================================
 
@@ -412,9 +455,124 @@ def read_prd() -> dict:
     return safe_read_json(PRD_FILE, {"userStories": [], "verified": False})
 
 
-def save_prd(prd: dict):
+def save_prd(prd: dict, commit: bool = False, message: str = None):
+    """Save PRD with optional git commit."""
     if not atomic_write_json(PRD_FILE, prd):
         log_error("Failed to save PRD")
+        return
+    
+    # Commit to git if git state available
+    if commit and GIT_STATE_AVAILABLE and _git_state_manager:
+        try:
+            _git_state_manager._run_git("add", str(PRD_FILE))
+            if message:
+                _git_state_manager._run_git("commit", "-m", message, "--allow-empty")
+        except Exception as e:
+            log_warning(f"Git commit failed: {e}")
+
+
+# =============================================================================
+# GIT-NATIVE STATE FUNCTIONS (v3.0)
+# =============================================================================
+
+def get_git_iteration() -> int:
+    """Get current iteration from git state."""
+    if GIT_STATE_AVAILABLE and _git_state_manager:
+        return _git_state_manager.get_iteration()
+    # Fallback: read from config
+    config = read_config()
+    return config.get("current_iteration", 0)
+
+
+def set_git_iteration(n: int):
+    """Set current iteration in git state."""
+    if GIT_STATE_AVAILABLE and _git_state_manager:
+        _git_state_manager.set_iteration(n)
+
+
+def get_git_task() -> str:
+    """Get current task ID from git state."""
+    if GIT_STATE_AVAILABLE and _git_state_manager:
+        return _git_state_manager.get_current_task()
+    return ""
+
+
+def set_git_task(task_id: str):
+    """Set current task ID in git state."""
+    if GIT_STATE_AVAILABLE and _git_state_manager:
+        _git_state_manager.set_current_task(task_id)
+
+
+def commit_iteration_to_git(iteration: int, task_id: str, summary: str) -> bool:
+    """Commit iteration progress to git with structured message."""
+    if GIT_STATE_AVAILABLE and _git_state_manager:
+        return _git_state_manager.commit_iteration(iteration, task_id, summary)
+    return False
+
+
+def add_learning_to_git(learning: str) -> bool:
+    """Add learning as git note."""
+    if GIT_STATE_AVAILABLE and _git_state_manager:
+        return _git_state_manager.add_learning(learning)
+    return False
+
+
+def get_learnings_from_git(limit: int = 100) -> List[str]:
+    """Get learnings from git notes."""
+    if GIT_STATE_AVAILABLE and _git_state_manager:
+        return _git_state_manager.get_learnings(limit=limit)
+    return []
+
+
+def save_checkpoint_to_git(iteration: int, task_id: str, status: str = "in_progress") -> bool:
+    """Save checkpoint as git tag."""
+    if GIT_STATE_AVAILABLE and _git_state_manager:
+        return _git_state_manager.save_checkpoint(iteration, task_id, status)
+    return False
+
+
+def load_checkpoint_from_git():
+    """Load latest checkpoint from git tag."""
+    if GIT_STATE_AVAILABLE and _git_state_manager:
+        return _git_state_manager.load_checkpoint()
+    return None
+
+
+def get_task_by_id(task_id: str):
+    """Get task by ID from TaskManager."""
+    if GIT_STATE_AVAILABLE and _task_manager:
+        return _task_manager.get_task(task_id)
+    return None
+
+
+def get_next_pending_task():
+    """Get next pending task from TaskManager."""
+    if GIT_STATE_AVAILABLE and _task_manager:
+        return _task_manager.get_next_task()
+    return None
+
+
+def set_task_status_by_id(task_id: str, status: str) -> bool:
+    """Set task status in TaskManager."""
+    if GIT_STATE_AVAILABLE and _task_manager:
+        return _task_manager.set_task_status(task_id, status)
+    return False
+
+
+def get_tasks_for_prompt() -> str:
+    """Get tasks formatted for LLM prompt."""
+    if GIT_STATE_AVAILABLE and _task_manager:
+        return _task_manager.to_prompt_format()
+    # Fallback: format old PRD
+    prd = read_prd()
+    lines = ["## Tasks\n"]
+    for story in prd.get("userStories", []):
+        status = "✅" if story.get("passes") else "⏳"
+        lines.append(f"### {status} {story.get('id', '?')}: {story.get('title', '')}")
+        if story.get("description"):
+            lines.append(story["description"])
+        lines.append("")
+    return "\n".join(lines)
 
 
 # =============================================================================
@@ -1934,6 +2092,8 @@ def handle_iteration_result(iteration: int, iter_type: str, output: str, config:
     if tags["learnings"] and learnings_mgr:
         for learning in tags["learnings"]:
             learnings_mgr.add(learning, iteration)
+            # Also save to git notes (v3.0)
+            add_learning_to_git(f"[iter-{iteration}] {learning}")
     
     # Record in divergence detector - store iteration number for later update
     divergence_iteration = None
@@ -2184,6 +2344,18 @@ def run_iteration(config: dict) -> Tuple[bool, str]:
         # FIX: Only increment counter AFTER successful completion
         # This prevents lost iterations if daemon crashes mid-iteration
         update_config("currentIteration", iteration)
+        
+        # Git-native state tracking (v3.0)
+        task_id = current_task.get("id", "") if current_task else iter_type
+        set_git_iteration(iteration)
+        set_git_task(task_id)
+        
+        # Commit iteration to git with structured message
+        summary = f"{result}"[:50]
+        commit_iteration_to_git(iteration, task_id, summary)
+        
+        # Save checkpoint for recovery
+        save_checkpoint_to_git(iteration, task_id, "completed" if result in ["task_done", "verified_pass"] else "in_progress")
         
         log(f"Iteration {iteration}: {result} ({int(elapsed)}s)")
         return True, result

@@ -39,6 +39,16 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Set
 from collections import deque, OrderedDict  # LRU cache uses OrderedDict for O(1) operations
 
+# Git-native state management (v5.0)
+try:
+    from git_state import (
+        GitStateManager, TaskManager, FormulaManager,
+        Task, generate_task_id, is_valid_task_id
+    )
+    GIT_STATE_AVAILABLE = True
+except ImportError:
+    GIT_STATE_AVAILABLE = False
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -105,7 +115,7 @@ if __name__ == "__main__":
 # CONFIGURATION
 # =============================================================================
 
-VERSION = "4.0.0"  # Container-native daemon architecture
+VERSION = "5.0.0"  # Git-native state management with bead-style task IDs
 
 # Runtime image - contains Python, Node, tools for agent
 RUNTIME_IMAGE = "docker.openhands.dev/openhands/runtime:latest-nikolaik"
@@ -6786,6 +6796,24 @@ class RalphManager:
         
         # Notification system for alerting
         self.notifier = NotificationManager(self.ralph_dir)
+        
+        # Git-native state management (v5.0)
+        self.git_state: Optional[GitStateManager] = None
+        self.task_manager: Optional[TaskManager] = None
+        self.formula_manager: Optional[FormulaManager] = None
+        
+        if GIT_STATE_AVAILABLE:
+            try:
+                self.git_state = GitStateManager(project.workspace)
+                self.task_manager = TaskManager(self.ralph_dir, project.name[:2])
+                self.formula_manager = FormulaManager(self.ralph_dir)
+                # Create built-in formulas if not exist
+                if not self.formula_manager.list_formulas():
+                    self.formula_manager.create_builtin_formulas()
+                log(f"Git-native state management enabled (v5.0)")
+            except Exception as e:
+                log_error(f"Failed to initialize git state: {e}")
+                self.git_state = None
     
     def _ensure_ralph_dir_exists(self):
         """Ensure .ralph directory and all subdirectories exist via Docker."""
@@ -7496,6 +7524,164 @@ When something fails, add a SIGN here so future iterations avoid the mistake.
             )
         except Exception:
             return None
+    
+    # =========================================================================
+    # GIT-NATIVE STATE METHODS (v5.0)
+    # =========================================================================
+    
+    def get_iteration(self) -> int:
+        """Get current iteration number (git-native or file fallback)."""
+        if self.git_state:
+            return self.git_state.get_iteration()
+        # Fallback: read from checkpoint
+        checkpoint = self.load_checkpoint()
+        return checkpoint.iteration if checkpoint else 0
+    
+    def set_iteration(self, n: int):
+        """Set current iteration number."""
+        if self.git_state:
+            self.git_state.set_iteration(n)
+    
+    def get_current_task_id(self) -> str:
+        """Get current task ID (git-native)."""
+        if self.git_state:
+            return self.git_state.get_current_task()
+        # Fallback: read from checkpoint
+        checkpoint = self.load_checkpoint()
+        return checkpoint.task_id if checkpoint else ""
+    
+    def set_current_task_id(self, task_id: str):
+        """Set current task ID."""
+        if self.git_state:
+            self.git_state.set_current_task(task_id)
+    
+    def get_ralph_status(self) -> str:
+        """Get Ralph status: running, paused, stopped."""
+        if self.git_state:
+            return self.git_state.get_status()
+        return "unknown"
+    
+    def set_ralph_status(self, status: str):
+        """Set Ralph status."""
+        if self.git_state:
+            self.git_state.set_status(status)
+    
+    def commit_iteration(self, iteration: int, task_id: str, summary: str) -> bool:
+        """Commit iteration progress to git."""
+        if self.git_state:
+            return self.git_state.commit_iteration(iteration, task_id, summary)
+        return False
+    
+    def add_learning_to_git(self, learning: str) -> bool:
+        """Add learning as git note."""
+        if self.git_state:
+            return self.git_state.add_learning(learning)
+        return False
+    
+    def get_learnings_from_git(self, limit: int = 100) -> List[str]:
+        """Get learnings from git notes."""
+        if self.git_state:
+            return self.git_state.get_learnings(limit=limit)
+        return []
+    
+    def write_handoff_to_git(self, task_id: str, message: str, context: dict = None) -> bool:
+        """Write handoff for next iteration via git notes."""
+        if self.git_state:
+            return self.git_state.write_handoff(task_id, message, context)
+        return self.git_handoff.write_handoff(task_id, message, context)
+    
+    def read_handoff_from_git(self) -> Optional[dict]:
+        """Read handoff from previous iteration."""
+        if self.git_state:
+            return self.git_state.read_handoff()
+        return self.git_handoff.read_handoff()
+    
+    # =========================================================================
+    # TASK MANAGER METHODS (v5.0 - bead-style IDs)
+    # =========================================================================
+    
+    def get_task(self, task_id: str) -> Optional[Task]:
+        """Get task by ID."""
+        if self.task_manager:
+            return self.task_manager.get_task(task_id)
+        return None
+    
+    def create_task(self, title: str, description: str = "", 
+                   depends: List[str] = None) -> Optional[Task]:
+        """Create new task with generated ID."""
+        if self.task_manager:
+            return self.task_manager.create_task(title, description, depends)
+        return None
+    
+    def set_task_status(self, task_id: str, status: str) -> bool:
+        """Set task status."""
+        if self.task_manager:
+            return self.task_manager.set_task_status(task_id, status)
+        return False
+    
+    def get_next_pending_task(self) -> Optional[Task]:
+        """Get next pending task (respecting dependencies)."""
+        if self.task_manager:
+            return self.task_manager.get_next_task()
+        return None
+    
+    def get_task_progress(self) -> Tuple[int, int]:
+        """Get (done, total) task count."""
+        if self.task_manager:
+            return self.task_manager.get_progress()
+        return self.project.get_ralph_progress()
+    
+    def get_tasks_for_prompt(self) -> str:
+        """Get tasks formatted for LLM prompt."""
+        if self.task_manager:
+            return self.task_manager.to_prompt_format()
+        # Fallback: format old PRD
+        prd = self.get_prd()
+        lines = ["## Tasks\n"]
+        for story in prd.get("userStories", []):
+            status = "✅" if story.get("passes") else "⏳"
+            lines.append(f"### {status} {story.get('id', '?')}: {story.get('title', '')}")
+            if story.get("description"):
+                lines.append(story["description"])
+            lines.append("")
+        return "\n".join(lines)
+    
+    def migrate_prd_to_tasks(self) -> bool:
+        """Migrate old prd.json to new tasks.json format."""
+        if not self.task_manager:
+            return False
+        
+        prd = self.get_prd()
+        if not prd.get("userStories"):
+            return True  # Nothing to migrate
+        
+        try:
+            for story in prd.get("userStories", []):
+                task = Task.from_user_story(story, self.project.name[:2])
+                self.task_manager._tasks[task.id] = task
+            
+            self.task_manager._save()
+            log(f"Migrated {len(prd['userStories'])} tasks from prd.json to tasks.json")
+            return True
+        except Exception as e:
+            log_error(f"Migration failed: {e}")
+            return False
+    
+    # =========================================================================
+    # FORMULA METHODS (v5.0)
+    # =========================================================================
+    
+    def list_formulas(self) -> List[str]:
+        """List available formula names."""
+        if self.formula_manager:
+            return self.formula_manager.list_formulas()
+        return []
+    
+    def cook_formula(self, name: str, vars: Dict[str, str] = None) -> List[Task]:
+        """Execute formula: create tasks from steps."""
+        if not self.formula_manager or not self.task_manager:
+            raise ValueError("Formula system not available")
+        return self.formula_manager.cook_formula(name, self.task_manager, vars)
     
     def cleanup_old_data(self):
         """Periodic cleanup to prevent unbounded growth."""
