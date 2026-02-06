@@ -497,24 +497,60 @@ def get_git_task() -> str:
     return ""
 
 
+def _sanitize_git_text(text: str, max_length: int = 200) -> str:
+    """Sanitize text for use in git commit/tag messages.
+    
+    Removes null bytes and control characters, limits length.
+    """
+    if not text:
+        return ""
+    # Remove null bytes and control characters (except newline for multi-line)
+    text = ''.join(c for c in text if c == '\n' or (ord(c) >= 32 and ord(c) != 127))
+    return text[:max_length]
+
+
 def set_git_task(task_id: str):
     """Set current task ID in git state."""
     if GIT_STATE_AVAILABLE and _git_state_manager:
-        _git_state_manager.set_current_task(task_id)
+        # Sanitize task_id
+        safe_task_id = _sanitize_git_text(str(task_id), 50)
+        _git_state_manager.set_current_task(safe_task_id)
 
 
 def commit_iteration_to_git(iteration: int, task_id: str, summary: str) -> bool:
     """Commit iteration progress to git with structured message."""
-    if GIT_STATE_AVAILABLE and _git_state_manager:
-        return _git_state_manager.commit_iteration(iteration, task_id, summary)
-    return False
+    if not GIT_STATE_AVAILABLE or not _git_state_manager:
+        return False
+    
+    # Validate and sanitize inputs
+    if not isinstance(iteration, int) or iteration < 0:
+        log_warning(f"Invalid iteration number: {iteration}")
+        return False
+    
+    safe_task_id = _sanitize_git_text(str(task_id), 50)
+    safe_summary = _sanitize_git_text(str(summary), 200)
+    
+    try:
+        return _git_state_manager.commit_iteration(iteration, safe_task_id, safe_summary)
+    except Exception as e:
+        log_warning(f"Git commit failed: {e}")
+        return False
 
 
 def add_learning_to_git(learning: str) -> bool:
     """Add learning as git note."""
-    if GIT_STATE_AVAILABLE and _git_state_manager:
-        return _git_state_manager.add_learning(learning)
-    return False
+    if not GIT_STATE_AVAILABLE or not _git_state_manager:
+        return False
+    
+    safe_learning = _sanitize_git_text(str(learning), 500)
+    if not safe_learning:
+        return False
+    
+    try:
+        return _git_state_manager.add_learning(safe_learning)
+    except Exception as e:
+        log_warning(f"Git learning add failed: {e}")
+        return False
 
 
 def get_learnings_from_git(limit: int = 100) -> List[str]:
@@ -2264,15 +2300,17 @@ def run_iteration(config: dict) -> Tuple[bool, str]:
     ITERATIONS_DIR.mkdir(parents=True, exist_ok=True)
     output_file = ITERATIONS_DIR / f"iteration_{iteration:04d}.log"
     
-    cmd = f"openhands --headless --json -t {shlex.quote(prompt)}"
+    # SECURITY FIX: Pass arguments directly to avoid shell injection
+    # (previously used bash -c which had double-interpretation risk)
     
     start_time = time.time()
     
     try:
         with open(output_file, "w") as f:
             # FIX: Use lock when setting current_process for thread-safe signal handling
+            # SECURITY FIX: Direct argument passing, no shell=True or bash -c
             proc = subprocess.Popen(
-                ["bash", "-c", cmd],
+                ["openhands", "--headless", "--json", "-t", prompt],
                 stdout=f,
                 stderr=subprocess.STDOUT,
                 cwd="/workspace"
@@ -2309,7 +2347,18 @@ def run_iteration(config: dict) -> Tuple[bool, str]:
             current_process = None
         elapsed = time.time() - start_time
         
-        output = output_file.read_text() if output_file.exists() else ""
+        # SECURITY FIX: Limit output file size to prevent OOM
+        MAX_OUTPUT_SIZE = 10_000_000  # 10MB
+        output = ""
+        if output_file.exists():
+            size = output_file.stat().st_size
+            if size > MAX_OUTPUT_SIZE:
+                log_warning(f"Output file too large ({size} bytes), truncating to {MAX_OUTPUT_SIZE}")
+                with open(output_file, 'r', errors='replace') as f:
+                    output = f.read(MAX_OUTPUT_SIZE)
+            else:
+                output = output_file.read_text(errors='replace')
+        
         result = handle_iteration_result(iteration, iter_type, output, config)
         
         # Save metadata
@@ -2414,10 +2463,35 @@ def main():
         except Exception:
             pass
     
-    PID_FILE.write_text(str(os.getpid()))
+    # SECURITY FIX: Write PID file with exclusive lock to prevent impersonation
+    try:
+        # Try to create with O_EXCL (fails if exists = atomic check-and-create)
+        fd = os.open(str(PID_FILE), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+        try:
+            os.write(fd, str(os.getpid()).encode())
+        finally:
+            os.close(fd)
+    except FileExistsError:
+        # Check if existing daemon is actually running
+        try:
+            old_pid = int(PID_FILE.read_text().strip())
+            os.kill(old_pid, 0)  # Check if process exists
+            log_error(f"Another daemon already running (PID {old_pid})")
+            sys.exit(1)
+        except (ProcessLookupError, ValueError, FileNotFoundError):
+            # Stale PID file, safe to overwrite
+            try:
+                PID_FILE.unlink()
+            except FileNotFoundError:
+                pass
+            fd = os.open(str(PID_FILE), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+            try:
+                os.write(fd, str(os.getpid()).encode())
+            finally:
+                os.close(fd)
     
     log("=" * 60)
-    log("Ralph Daemon v2.0 Started - Enhanced Autonomy")
+    log(f"Ralph Daemon v{DAEMON_VERSION} Started - Git-Native State")
     log(f"PID: {os.getpid()}")
     log(f"Context budget: {CONTEXT_BUDGET_CHARS} chars (~{CONTEXT_BUDGET_CHARS // 4000}K tokens)")
     log("=" * 60)
