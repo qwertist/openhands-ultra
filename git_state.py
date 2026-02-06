@@ -19,8 +19,10 @@ Benefits:
 """
 
 import json
+import os
 import secrets
 import subprocess
+import tempfile
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -39,7 +41,16 @@ def generate_task_id(prefix: str = "oh") -> str:
     Generate bead-style task ID: prefix-xxxxx
     
     Examples: oh-k7m2x, oh-a3b1c, oh-p9n4q
+    
+    Args:
+        prefix: 2-10 alphanumeric characters
+    
+    Raises:
+        ValueError: if prefix is invalid
     """
+    # Validate prefix
+    if not prefix or not prefix.isalnum() or len(prefix) < 2 or len(prefix) > 10:
+        raise ValueError(f"Invalid prefix: {prefix!r} (must be 2-10 alphanumeric chars)")
     return f"{prefix}-{secrets.token_hex(3)[:5]}"
 
 
@@ -195,12 +206,78 @@ class GitStateManager:
             raise
     
     # =========================================================================
+    # SECURITY HELPERS
+    # =========================================================================
+    
+    def _validate_ref_name(self, ref_name: str) -> bool:
+        """Validate ref name to prevent path traversal."""
+        if not ref_name:
+            return False
+        # Only allow alphanumeric, dash, underscore, forward slash
+        if not all(c.isalnum() or c in '-_/' for c in ref_name):
+            return False
+        # Prevent path traversal
+        if '..' in ref_name or ref_name.startswith('/'):
+            return False
+        # Max length
+        if len(ref_name) > 200:
+            return False
+        return True
+    
+    def _validate_tag_name(self, tag_name: str) -> bool:
+        """Validate git tag name."""
+        if not tag_name or len(tag_name) > 250:
+            return False
+        # Git tag names: alphanumeric, dash, underscore, forward slash
+        if not all(c.isalnum() or c in '-_/' for c in tag_name):
+            return False
+        if '..' in tag_name:
+            return False
+        return True
+    
+    def _sanitize_message(self, msg: str, max_length: int = 1000) -> str:
+        """Sanitize string for git commit/tag message."""
+        if not msg:
+            return ""
+        # Truncate
+        msg = msg[:max_length]
+        # Remove null bytes and control chars (except newline)
+        msg = ''.join(c for c in msg if c == '\n' or (ord(c) >= 32 and ord(c) != 127))
+        return msg
+    
+    def _validate_file_path(self, file_path: str) -> bool:
+        """Validate file path is within workspace."""
+        if not file_path:
+            return False
+        try:
+            resolved = (self.workspace / file_path).resolve()
+            workspace_resolved = self.workspace.resolve()
+            return str(resolved).startswith(str(workspace_resolved) + '/')
+        except Exception:
+            return False
+    
+    # =========================================================================
     # STATE VIA GIT REFS
     # =========================================================================
     
     def _write_ref(self, ref_name: str, value: str) -> bool:
-        """Write value to a git ref file (not a real ref, just storage)."""
-        ref_path = self.workspace / ".git" / ref_name
+        """Write value to a git ref file (not a real ref, just storage).
+        
+        SECURITY: Validates ref_name to prevent path traversal.
+        """
+        # SECURITY FIX: Validate ref name
+        if not self._validate_ref_name(ref_name):
+            logger.error(f"Invalid ref name (possible path traversal): {ref_name}")
+            return False
+        
+        ref_path = (self.workspace / ".git" / ref_name).resolve()
+        git_dir = (self.workspace / ".git").resolve()
+        
+        # SECURITY FIX: Ensure path is under .git
+        if not str(ref_path).startswith(str(git_dir) + '/'):
+            logger.error(f"Ref path escapes .git directory: {ref_path}")
+            return False
+        
         try:
             ref_path.parent.mkdir(parents=True, exist_ok=True)
             ref_path.write_text(value)
@@ -210,8 +287,23 @@ class GitStateManager:
             return False
     
     def _read_ref(self, ref_name: str, default: str = "") -> str:
-        """Read value from a git ref file."""
-        ref_path = self.workspace / ".git" / ref_name
+        """Read value from a git ref file.
+        
+        SECURITY: Validates ref_name to prevent path traversal.
+        """
+        # SECURITY FIX: Validate ref name
+        if not self._validate_ref_name(ref_name):
+            logger.error(f"Invalid ref name (possible path traversal): {ref_name}")
+            return default
+        
+        ref_path = (self.workspace / ".git" / ref_name).resolve()
+        git_dir = (self.workspace / ".git").resolve()
+        
+        # SECURITY FIX: Ensure path is under .git
+        if not str(ref_path).startswith(str(git_dir) + '/'):
+            logger.error(f"Ref path escapes .git directory: {ref_path}")
+            return default
+        
         try:
             if ref_path.exists():
                 return ref_path.read_text().strip()
@@ -340,11 +432,24 @@ class GitStateManager:
         Commit iteration progress with structured message.
         
         Message format: [Ralph:Iter:N] task-id: summary
+        
+        SECURITY: Validates file paths and sanitizes message content.
         """
         # Stage files
         if files:
             for f in files:
-                self._run_git("add", f, check=False)
+                # SECURITY FIX: Validate file path is within workspace
+                if not self._validate_file_path(f):
+                    logger.warning(f"Skipping file outside workspace: {f}")
+                    continue
+                # Use relative path for git add
+                try:
+                    file_path = (self.workspace / f).resolve()
+                    rel_path = file_path.relative_to(self.workspace.resolve())
+                    self._run_git("add", str(rel_path), check=False)
+                except ValueError:
+                    logger.warning(f"Cannot resolve relative path: {f}")
+                    continue
         else:
             # Stage all changes in .ralph/
             self._run_git("add", ".ralph/", check=False)
@@ -355,8 +460,12 @@ class GitStateManager:
             logger.debug("No changes to commit for iteration")
             return True  # No changes is OK
         
+        # SECURITY FIX: Sanitize message components
+        safe_task_id = self._sanitize_message(str(task_id), 100)
+        safe_summary = self._sanitize_message(str(summary), 500)
+        
         # Commit with structured message
-        message = f"[Ralph:Iter:{iteration}] {task_id}: {summary}"
+        message = f"[Ralph:Iter:{iteration}] {safe_task_id}: {safe_summary}"
         result = self._run_git("commit", "-m", message, "--allow-empty")
         return result.returncode == 0
     
@@ -513,12 +622,14 @@ class GitStateManager:
     
     def get_state_summary(self) -> dict:
         """Get complete state summary."""
+        # FIX: Load checkpoint once, not twice
+        checkpoint = self.load_checkpoint()
         return {
             "iteration": self.get_iteration(),
             "task": self.get_current_task(),
             "status": self.get_status(),
             "head": self._get_head_commit(),
-            "checkpoint": self.load_checkpoint().to_dict() if self.load_checkpoint() else None,
+            "checkpoint": checkpoint.to_dict() if checkpoint else None,
             "learnings_count": len(self.get_learnings(limit=1000))
         }
     
@@ -591,7 +702,10 @@ class TaskManager:
         logger.info(f"Migrated {len(stories)} user stories to tasks")
     
     def _save(self) -> bool:
-        """Save tasks to file."""
+        """Save tasks to file atomically.
+        
+        Uses write-to-temp-then-rename pattern for crash safety.
+        """
         try:
             data = {
                 "version": self.VERSION,
@@ -602,7 +716,25 @@ class TaskManager:
             }
             
             self.ralph_dir.mkdir(parents=True, exist_ok=True)
-            self.tasks_file.write_text(json.dumps(data, indent=2))
+            
+            # Atomic write: write to temp file, then rename
+            fd, temp_path = tempfile.mkstemp(
+                dir=self.ralph_dir,
+                prefix='.tasks_',
+                suffix='.json'
+            )
+            try:
+                with os.fdopen(fd, 'w') as f:
+                    json.dump(data, f, indent=2)
+                os.rename(temp_path, self.tasks_file)
+            except Exception:
+                # Clean up temp file on error
+                try:
+                    os.unlink(temp_path)
+                except OSError:
+                    pass
+                raise
+            
             return True
         except Exception as e:
             logger.error(f"Failed to save tasks: {e}")
