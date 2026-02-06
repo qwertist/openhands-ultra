@@ -49,9 +49,16 @@ is_heartbeat_stale() {
         return 0  # No heartbeat = stale
     fi
     
+    # CRITICAL FIX: Handle clock skew between container and host
+    # by using absolute value of age difference
     heartbeat_time=$(cat "$HEARTBEAT_FILE" 2>/dev/null)
     current_time=$(date +%s)
     age=$((current_time - heartbeat_time))
+    
+    # Handle negative age (clock skew) by using absolute value
+    if [ "$age" -lt 0 ]; then
+        age=$((-age))
+    fi
     
     if [ "$age" -gt "$MAX_HEARTBEAT_AGE" ]; then
         return 0  # Stale

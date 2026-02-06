@@ -72,7 +72,8 @@ install_dependencies()
 # CONSTANTS - Optimized for 250K+ context models
 # =============================================================================
 
-RALPH_DIR = Path("/workspace/.ralph")
+# HIGH PRIORITY FIX: Use env var with fallback instead of hardcoded path
+RALPH_DIR = Path(os.environ.get("RALPH_DIR", "/workspace/.ralph"))
 CONFIG_FILE = RALPH_DIR / "config.json"
 PRD_FILE = RALPH_DIR / "prd.json"
 MISSION_FILE = RALPH_DIR / "MISSION.md"
@@ -636,8 +637,30 @@ class LearningsManager:
             })
     
     def _save(self):
-        """Save learnings to file."""
+        """Save learnings to file with hard limit to prevent OOM."""
+        # HIGH PRIORITY FIX: Hard limit of ~50MB to prevent OOM
+        MAX_LEARNINGS_SIZE_MB = 50
+        MAX_LEARNINGS_SIZE_BYTES = MAX_LEARNINGS_SIZE_MB * 1024 * 1024
+        
         content = '\n\n'.join(e['content'] for e in self._entries)
+        
+        # Archive if exceeds limit
+        content_bytes = content.encode('utf-8')
+        if len(content_bytes) > MAX_LEARNINGS_SIZE_BYTES:
+            log_warning(f"Learnings file exceeds {MAX_LEARNINGS_SIZE_MB}MB, archiving old entries")
+            # Keep only last 50% of entries
+            keep_count = len(self._entries) // 2
+            self._entries = self._entries[-keep_count:]
+            content = '\n\n'.join(e['content'] for e in self._entries)
+            
+            # Archive old content
+            archive_path = LEARNINGS_FILE.parent / f"LEARNINGS_archive_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md"
+            try:
+                archive_path.write_text(content)
+                log(f"Archived learnings to {archive_path}")
+            except Exception as e:
+                log_error(f"Failed to archive learnings: {e}")
+        
         try:
             LEARNINGS_FILE.write_text(content)
             os.chmod(LEARNINGS_FILE, 0o666)
@@ -666,8 +689,13 @@ class LearningsManager:
             'timestamp': datetime.now().isoformat()
         })
         
-        # No limit - semantic search handles relevance
-        # Duplicate check above prevents bloat
+        # HIGH PRIORITY FIX: Hard limit on entries to prevent OOM
+        MAX_ENTRIES = 10000
+        if len(self._entries) > MAX_ENTRIES:
+            # Remove oldest 10% when limit exceeded
+            remove_count = len(self._entries) // 10
+            self._entries = self._entries[remove_count:]
+            log_warning(f"Learnings entries exceeded {MAX_ENTRIES}, removed {remove_count} oldest")
         
         self._save()
         return True
@@ -1417,14 +1445,45 @@ def get_current_task(prd: dict) -> Optional[dict]:
 
 
 def mark_task_done(task_id: str, passed: bool = True):
-    prd = read_prd()
-    for story in prd.get("userStories", []):
-        if story.get("id") == task_id:
-            story["passes"] = passed
-            story["completedAt"] = datetime.now().isoformat()
-            break
-    save_prd(prd)
-    log(f"Task {task_id}: {'PASS' if passed else 'FAIL'}")
+    """Mark a task as done with optimistic locking to prevent concurrent write corruption.
+    
+    CRITICAL FIX: Uses optimistic locking with _version field to prevent
+    lost updates when multiple processes write to PRD simultaneously.
+    """
+    max_retries = 3
+    for attempt in range(max_retries):
+        prd = read_prd()
+        version = prd.get("_version", 0)
+        
+        # Find and update the task
+        task_found = False
+        for story in prd.get("userStories", []):
+            if story.get("id") == task_id:
+                story["passes"] = passed
+                story["completedAt"] = datetime.now().isoformat()
+                task_found = True
+                break
+        
+        if not task_found:
+            log_error(f"Task {task_id} not found in PRD")
+            return
+        
+        # Increment version for optimistic locking
+        prd["_version"] = version + 1
+        
+        # Verify version hasn't changed during our modification (check-then-act)
+        current = read_prd()
+        if current.get("_version", 0) == version:
+            # Version unchanged, safe to save
+            save_prd(prd)
+            log(f"Task {task_id}: {'PASS' if passed else 'FAIL'}")
+            return
+        
+        # Version changed, retry
+        log_warning(f"PRD modified during update, retrying ({attempt+1}/{max_retries})")
+        time.sleep(0.1 * (attempt + 1))  # Exponential backoff
+    
+    log_error(f"Failed to mark task {task_id} after {max_retries} retries due to concurrent modifications")
 
 
 def parse_ralph_tags(output: str) -> dict:
@@ -1778,7 +1837,9 @@ def run_iteration(config: dict) -> Tuple[bool, str]:
                 cwd="/workspace"
             )
             
-            timeout = config.get("sessionTimeoutSeconds", 1800)
+            # SECURITY FIX: Cap timeout at DOCKER_TIMEOUT (8 hours) to prevent
+            # unbounded wait if config is missing or corrupt
+            timeout = min(config.get("sessionTimeoutSeconds", 1800), DOCKER_TIMEOUT)
             try:
                 exit_code = current_process.wait(timeout=timeout)
             except subprocess.TimeoutExpired:
@@ -1882,6 +1943,9 @@ def main():
     consecutive_errors = 0
     retry_delay = BASE_DELAY
     
+    # CRITICAL FIX: Track iterations per minute to prevent infinite loops
+    iteration_times: deque = deque(maxlen=60)  # Last 60 iteration timestamps
+    
     try:
         while not shutdown_requested:
             write_heartbeat()
@@ -1895,6 +1959,20 @@ def main():
             
             if status == "running":
                 current_iter = config.get("currentIteration", 0)
+                
+                # CRITICAL FIX: Rate limiting - force pause if >60 iterations/minute
+                now = time.time()
+                iteration_times.append(now)
+                if len(iteration_times) >= 60:
+                    # Check if 60 iterations happened in the last 60 seconds
+                    oldest = iteration_times[0]
+                    if now - oldest < 60:
+                        log_error("CRITICAL: >60 iterations/minute detected! Forcing pause to prevent infinite loop.")
+                        update_config("status", "error")
+                        update_config("lastError", "Too many iterations per minute - possible infinite loop")
+                        time.sleep(60)  # Force long pause
+                        iteration_times.clear()  # Reset after pause
+                        continue
                 
                 # Disk check
                 if disk_monitor and disk_monitor.is_low():

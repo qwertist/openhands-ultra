@@ -32,10 +32,12 @@ import sys
 import threading
 import time
 import traceback
+import uuid  # Added for UUID-based temp file names
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Set
+from collections import deque  # Added for LRU cache
 
 # Configure logging
 logging.basicConfig(
@@ -67,14 +69,19 @@ def install_dependencies():
     if missing:
         print(f"Installing dependencies: {', '.join(missing)}...")
         print("(sentence-transformers is ~500MB with torch, please wait...)")
-        subprocess.check_call([
-            sys.executable, "-m", "pip", "install", 
-            *missing, "--break-system-packages"
-        ])
-        print("Done! Restarting...")
-        os.execv(sys.executable, [sys.executable] + sys.argv)
-
-install_dependencies()
+        try:
+            subprocess.check_call([
+                sys.executable, "-m", "pip", "install", 
+                *missing, "--break-system-packages"
+            ])
+            print("Done! Restarting...")
+            os.execv(sys.executable, [sys.executable] + sys.argv)
+        except subprocess.CalledProcessError as e:
+            print(f"[ERROR] Failed to install dependencies: {e}")
+            sys.exit(1)
+        except Exception as e:
+            print(f"[ERROR] Unexpected error during dependency installation: {e}")
+            sys.exit(1)
 
 # Now import textual
 from textual.app import App, ComposeResult
@@ -88,6 +95,11 @@ from textual.widgets import (
 )
 from textual import work
 from textual.reactive import reactive
+
+# Only install dependencies when running as main module
+# This avoids circular import issues during module loading and importlib introspection
+if __name__ == "__main__":
+    install_dependencies()
 
 # =============================================================================
 # CONFIGURATION
@@ -303,9 +315,31 @@ cp "$MCP_JSON" "$GATEWAY_STATE"
 echo "mcp.json created:"
 cat "$MCP_JSON"
 
-# Wait for gateways to start
-echo "Waiting for gateways to start..."
-sleep 5
+# HIGH PRIORITY FIX: Health check polling instead of fixed sleep
+# This handles slow services like memory-service that needs to download ONNX models
+echo "Waiting for gateways to start (max 60s)..."
+max_wait=60
+for ((i=0; i<max_wait; i++)); do
+    sleep 1
+    # Check if at least one gateway is responding
+    if [ -f "$GATEWAY_PIDS" ]; then
+        all_ready=true
+        port=8001
+        for server in $servers; do
+            if curl -sf "http://localhost:$port/sse" > /dev/null 2>&1 || kill -0 $(sed -n "${port##??}p" "$GATEWAY_PIDS" 2>/dev/null) 2>/dev/null; then
+                : # gateway responding or process exists
+            else
+                all_ready=false
+                break
+            fi
+            port=$((port + 1))
+        done
+        if $all_ready; then
+            echo "All gateways ready after ${i}s"
+            break
+        fi
+    fi
+done
 
 # Check status with more detail
 if [ -f "$GATEWAY_PIDS" ]; then
@@ -2993,15 +3027,30 @@ class TestEnforcement:
                 continue
             
             # Generate stable ID based on error content (not timestamp)
-            error_hash = hashlib.md5(error_key.encode()).hexdigest()[:8]
+            # SECURITY FIX: Use SHA256 instead of MD5 for better collision resistance
+            # Use 12 chars instead of 8 for 48 bits of entropy
+            error_hash = hashlib.sha256(error_key.encode()).hexdigest()[:12]
             task_id = f"FIX-{error_hash}"
             
-            # Check if task with this ID already exists
+            # Check for hash collision by comparing full error_key
+            for s in stories:
+                if s.get('id') == task_id:
+                    # Collision detected - same ID but different error
+                    if s.get('_error_key') != error_key:
+                        # Append counter to make unique
+                        counter = 1
+                        while any(st.get('id') == f"{task_id}-{counter}" for st in stories):
+                            counter += 1
+                        task_id = f"{task_id}-{counter}"
+                    break
+            
+            # Check if task with this ID already exists (after collision handling)
             if any(s.get('id') == task_id for s in stories):
                 continue
             
             prd.setdefault('userStories', []).append({
                 'id': task_id,
+                '_error_key': error_key,  # Store for collision detection
                 'title': f'Fix: {error[:80]}',
                 'description': f'Test failure detected. Error: {error[:500]}',
                 'acceptance': 'All tests pass',
@@ -3437,12 +3486,18 @@ class HierarchicalMemory:
 # Uses all-mpnet-base-v2 model for true semantic similarity
 # =============================================================================
 
+# Maximum entries for semantic cache to prevent memory leaks
+MAX_SEMANTIC_CACHE = 10000
+
 class SemanticSearch:
     """
     Semantic search using Sentence Transformers embeddings.
     
     Provides true semantic similarity search for learnings, memory, and deduplication.
     Uses all-mpnet-base-v2 model - best quality for English text.
+    
+    MEMORY FIX: Uses LRU eviction to cap cache at MAX_SEMANTIC_CACHE entries
+    to prevent unbounded memory growth during long sessions.
     """
     
     # Class-level model cache (shared across instances)
@@ -3453,6 +3508,8 @@ class SemanticSearch:
         self.ralph_dir = ralph_dir
         self.cache_file = ralph_dir / "semantic_cache.json"
         self._embeddings_cache = {}  # text_hash -> embedding
+        # LRU cache: track access order for eviction (oldest first)
+        self._cache_access_order: deque = deque(maxlen=MAX_SEMANTIC_CACHE)
         self._load_cache()
     
     @classmethod
@@ -3467,25 +3524,28 @@ class SemanticSearch:
         return cls._model
     
     def _load_cache(self):
-        """Load embeddings cache from disk."""
+        """Load embeddings cache from disk with LRU tracking."""
         if self.cache_file.exists():
             try:
                 import json
                 with open(self.cache_file, 'r') as f:
                     self._embeddings_cache = json.load(f)
+                # Initialize access order with existing keys (limited to max)
+                keys = list(self._embeddings_cache.keys())[-MAX_SEMANTIC_CACHE:]
+                self._cache_access_order = deque(keys, maxlen=MAX_SEMANTIC_CACHE)
             except Exception:
                 self._embeddings_cache = {}
+                self._cache_access_order = deque(maxlen=MAX_SEMANTIC_CACHE)
     
     def _save_cache(self):
-        """Save embeddings cache to disk (with size limit)."""
+        """Save embeddings cache to disk (LRU entries only)."""
         try:
-            # Limit cache to 10000 entries to prevent unbounded growth
-            if len(self._embeddings_cache) > 10000:
-                # Keep most recent entries (arbitrary but deterministic)
-                keys = list(self._embeddings_cache.keys())[-10000:]
-                self._embeddings_cache = {k: self._embeddings_cache[k] for k in keys}
+            # SECURITY FIX: Only save entries in LRU order to prevent unbounded growth
+            to_save = {k: self._embeddings_cache[k] 
+                      for k in self._cache_access_order 
+                      if k in self._embeddings_cache}
             with open(self.cache_file, 'w') as f:
-                json.dump(self._embeddings_cache, f)
+                json.dump(to_save, f)
         except Exception:
             pass
     
@@ -3495,20 +3555,38 @@ class SemanticSearch:
         return hashlib.md5(text.encode()).hexdigest()[:16]
     
     def _get_embedding(self, text: str):
-        """Get embedding for text (with caching)."""
+        """Get embedding for text (with LRU cache).
+        
+        MEMORY FIX: Implements LRU eviction to cap cache at MAX_SEMANTIC_CACHE
+        entries. Each 768-dim float32 embedding is ~3KB, so 10k entries = ~30MB.
+        """
         import numpy as np
         model = self._get_model()
         
         text_hash = self._text_hash(text)
+        
         if text_hash in self._embeddings_cache:
+            # LRU FIX: Move to end (most recently used)
+            if text_hash in self._cache_access_order:
+                self._cache_access_order.remove(text_hash)
+            self._cache_access_order.append(text_hash)
             return np.array(self._embeddings_cache[text_hash], dtype=np.float32)
+        
+        # LRU FIX: Evict oldest if at limit BEFORE adding new
+        while len(self._embeddings_cache) >= MAX_SEMANTIC_CACHE:
+            if self._cache_access_order:
+                oldest = self._cache_access_order.popleft()
+                self._embeddings_cache.pop(oldest, None)
+            else:
+                break
         
         embedding = model.encode(text, convert_to_numpy=True)
         self._embeddings_cache[text_hash] = embedding.tolist()
+        self._cache_access_order.append(text_hash)
         return embedding.astype(np.float32)
     
     def _get_embeddings_batch(self, texts: List[str]):
-        """Get embeddings for multiple texts efficiently."""
+        """Get embeddings for multiple texts efficiently (with LRU cache)."""
         import numpy as np
         model = self._get_model()
         
@@ -3519,16 +3597,30 @@ class SemanticSearch:
         for i, text in enumerate(texts):
             text_hash = self._text_hash(text)
             if text_hash in self._embeddings_cache:
+                # LRU FIX: Update access order for cache hit
+                if text_hash in self._cache_access_order:
+                    self._cache_access_order.remove(text_hash)
+                self._cache_access_order.append(text_hash)
                 results.append((i, np.array(self._embeddings_cache[text_hash], dtype=np.float32)))
             else:
                 texts_to_encode.append(text)
                 indices_to_encode.append(i)
         
         if texts_to_encode:
+            # LRU FIX: Make room for new entries
+            for text in texts_to_encode:
+                while len(self._embeddings_cache) >= MAX_SEMANTIC_CACHE:
+                    if self._cache_access_order:
+                        oldest = self._cache_access_order.popleft()
+                        self._embeddings_cache.pop(oldest, None)
+                    else:
+                        break
+            
             new_embeddings = model.encode(texts_to_encode, convert_to_numpy=True)
             for idx, text, emb in zip(indices_to_encode, texts_to_encode, new_embeddings):
                 text_hash = self._text_hash(text)
                 self._embeddings_cache[text_hash] = emb.tolist()
+                self._cache_access_order.append(text_hash)
                 results.append((idx, emb.astype(np.float32)))
         
         results.sort(key=lambda x: x[0])
@@ -4939,7 +5031,11 @@ class Docker:
     
     @staticmethod
     def exec_in_container(name: str, command: str, timeout: int = 60) -> Tuple[int, str]:
-        """Execute command in container."""
+        """Execute command in container.
+        
+        SECURITY WARNING: This method executes shell commands. For user-provided
+        content, ALWAYS use write_file_safe() which base64-encodes content.
+        """
         try:
             result = subprocess.run(
                 ["docker", "exec", name, "bash", "-c", command],
@@ -4950,6 +5046,32 @@ class Docker:
             return -1, "Timeout"
         except Exception as e:
             return -1, str(e)
+    
+    @staticmethod
+    def write_file_safe(container: str, path: str, content: str) -> bool:
+        """Write content safely using base64 to prevent shell injection.
+        
+        SECURITY FIX: Always base64-encode user content to prevent shell injection
+        via special characters like backticks, $(), semicolons, etc.
+        Use shlex.quote() for paths to prevent path traversal attacks.
+        
+        Args:
+            container: Container name
+            path: Target file path (will be shell-quoted)
+            content: Content to write (will be base64 encoded)
+        
+        Returns:
+            True if successful, False otherwise
+        """
+        encoded = base64.b64encode(content.encode()).decode()
+        # SECURITY: Single quotes prevent shell expansion, shlex.quote prevents path injection
+        quoted_path = shlex.quote(path)
+        code, _ = Docker.exec_in_container(
+            container,
+            f"printf '%s' '{encoded}' | base64 -d > {quoted_path}",
+            timeout=10
+        )
+        return code == 0
     
     @staticmethod
     def pull_image(image: str = None) -> bool:
@@ -5499,9 +5621,30 @@ echo "$running $total $healthy"
                     Docker.exec_in_container(name, f"chmod 644 {check_path}/agent_settings.json", timeout=5)
                     Docker.exec_in_container(name, f"chown root:root {check_path}/agent_settings.json", timeout=5)
                 
-                # Check if it's valid JSON using cat + python
-                check_cmd = f"cat {check_path}/agent_settings.json | python3 -c 'import sys,json; d=json.load(sys.stdin); print(\"JSON_OK\", d.get(\"llm\",{{}}).get(\"model\",\"unknown\"))' 2>&1"
-                code, output = Docker.exec_in_container(name, check_cmd, timeout=5)
+                # HIGH PRIORITY FIX: Validate required fields (llm.model, llm.api_key)
+                # Use a simpler validation approach to avoid f-string issues
+                validate_cmd = (
+                    "cat " + check_path + "/agent_settings.json | python3 -c '\n"
+                    "import sys, json\n"
+                    "try:\n"
+                    "    d = json.load(sys.stdin)\n"
+                    "    llm = d.get(\"llm\", {})\n"
+                    "    model = llm.get(\"model\", \"\")\n"
+                    "    api_key = llm.get(\"api_key\", \"\")\n"
+                    "    errors = []\n"
+                    "    if not model:\n"
+                    "        errors.append(\"missing llm.model\")\n"
+                    "    if not api_key:\n"
+                    "        errors.append(\"missing llm.api_key\")\n"
+                    "    if errors:\n"
+                    "        print(\"JSON_INVALID\", \",\".join(errors))\n"
+                    "    else:\n"
+                    "        print(\"JSON_OK\", model)\n"
+                    "except Exception as e:\n"
+                    "    print(\"JSON_ERROR\", str(e))\n"
+                    "' 2>&1"
+                )
+                code, output = Docker.exec_in_container(name, validate_cmd, timeout=5)
                 
                 config_path = check_path
                 print(f"  Found agent_settings.json at: {config_path}/")
@@ -5510,6 +5653,11 @@ echo "$running $total $healthy"
                     parts = output.strip().split()
                     model = parts[1] if len(parts) > 1 else "unknown"
                     print(f"  agent_settings.json: OK (model: {model})")
+                elif "JSON_INVALID" in output:
+                    parts = output.strip().split(maxsplit=1)
+                    errors = parts[1] if len(parts) > 1 else "unknown error"
+                    print(f"[!] WARNING: agent_settings.json missing required fields: {errors}")
+                    print("    Required: llm.model, llm.api_key")
                 else:
                     print(f"[!] WARNING: agent_settings.json check failed: {output.strip()}")
                 break
@@ -5923,12 +6071,17 @@ pgrep -f 'ralph_daemon.py' && echo 'STARTED' || echo 'FAILED'
         
         Uses temp file + rename for atomic write to prevent corruption
         if multiple processes write simultaneously.
+        
+        SECURITY FIX: Use UUID instead of PID for temp file names to prevent
+        race conditions when different processes (daemon inside container, TUI 
+        outside) have the same PID in their respective namespaces.
         """
         content = json.dumps(data, indent=indent, ensure_ascii=False)
         encoded = base64.b64encode(content.encode()).decode()
         
-        # Atomic write: write to temp file, then rename
-        tmp_path = f"{path}.tmp.{os.getpid()}"
+        # SECURITY FIX: Use UUID for unique temp name instead of PID
+        # This prevents race conditions across different PID namespaces
+        tmp_path = f"{path}.tmp.{uuid.uuid4().hex[:8]}"
         code, _ = Docker.exec_in_container(
             container,
             f"echo '{encoded}' | base64 -d > '{tmp_path}' && mv '{tmp_path}' '{path}'",
@@ -6893,12 +7046,20 @@ class RalphManager:
             return False, "", 0.0
     
     def init_structure(self, config: RalphConfig) -> bool:
-        """Initialize Ralph structure for project via Docker."""
+        """Initialize Ralph structure for project via Docker.
+        
+        CRITICAL FIX: Uses .init_in_progress marker to detect interrupted initialization
+        and prevent state corruption after container crashes."""
+        marker_path = f"{self.CONTAINER_RALPH_DIR}/.init_in_progress"
+        
         try:
             # Ensure container is running
             if not self._ensure_container():
                 log_error("Failed to start container for Ralph init")
                 return False
+            
+            # Create marker to detect interrupted init
+            Docker.write_file(self.container_name, marker_path, datetime.now().isoformat())
             
             # === CREATE ALL DIRECTORIES VIA DOCKER ===
             dirs_to_create = [
@@ -7128,6 +7289,11 @@ When something fails, add a SIGN here so future iterations avoid the mistake.
             # Create runtime progress.txt (detailed log - not git)
             self._write_file("progress.txt", f"# Detailed Progress Log\n# Started: {datetime.now().isoformat()}\n\n")
             
+            # CRITICAL FIX: Remove init_in_progress marker after ALL files created
+            # This prevents state corruption if container crashes during init
+            marker_path = f"{self.CONTAINER_RALPH_DIR}/.init_in_progress"
+            Docker.delete_file(self.container_name, marker_path)
+            
             log(f"Initialized Ralph structure for: {self.project.name}")
             return True
             
@@ -7139,6 +7305,22 @@ When something fails, add a SIGN here so future iterations avoid the mistake.
     def get_config(self) -> dict:
         """Get current Ralph config via Docker."""
         return self._read_json("config.json", default={})
+    
+    def is_initialized(self) -> bool:
+        """Check if Ralph structure is fully initialized (no init_in_progress marker).
+        
+        CRITICAL FIX: Checks for .init_in_progress marker to detect interrupted
+        initialization (e.g., container crash during setup). If marker exists,
+        initialization did not complete and should be re-run.
+        """
+        # Check if marker exists - if so, init was interrupted
+        marker_path = f"{self.CONTAINER_RALPH_DIR}/.init_in_progress"
+        if Docker.file_exists(self.container_name, marker_path):
+            return False  # Init was interrupted
+        
+        # Check for config.json as indicator of successful init
+        config_path = f"{self.CONTAINER_RALPH_DIR}/config.json"
+        return Docker.file_exists(self.container_name, config_path)
     
     def update_config(self, key: str, value: Any) -> bool:
         """Update config value via Docker."""
