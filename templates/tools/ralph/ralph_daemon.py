@@ -453,11 +453,52 @@ def update_config(key: str, value):
 
 
 def read_prd() -> dict:
+    """Read PRD - uses TaskManager when available, falls back to file.
+    
+    DUAL-WRITE FIX: TaskManager is now the source of truth.
+    """
+    if GIT_STATE_AVAILABLE and _task_manager:
+        # Convert TaskManager format to legacy PRD format
+        tasks = _task_manager.get_all_tasks()
+        user_stories = []
+        for task in tasks:
+            story = {
+                "id": task.id,
+                "title": task.title,
+                "description": task.description,
+                "status": task.status,
+                "passes": task.status == "done",
+                "depends": task.depends,
+            }
+            user_stories.append(story)
+        return {"userStories": user_stories, "verified": False}
+    
+    # Fallback to file (no git state)
     return safe_read_json(PRD_FILE, {"userStories": [], "verified": False})
 
 
 def save_prd(prd: dict, commit: bool = False, message: str = None):
-    """Save PRD with optional git commit."""
+    """Save PRD - uses TaskManager when available.
+    
+    DUAL-WRITE FIX: Only write to TaskManager, not file.
+    """
+    if GIT_STATE_AVAILABLE and _task_manager:
+        # Update tasks from PRD format
+        for story in prd.get("userStories", []):
+            task_id = story.get("id")
+            if not task_id:
+                continue
+            
+            # Update status based on passes field
+            if story.get("passes"):
+                _task_manager.set_task_status(task_id, "done")
+            elif story.get("status"):
+                _task_manager.set_task_status(task_id, story["status"])
+        
+        log_debug("PRD saved to TaskManager (git-native)")
+        return
+    
+    # Fallback to file (no git state)
     if not atomic_write_json(PRD_FILE, prd):
         log_error("Failed to save PRD")
         return
@@ -1878,34 +1919,51 @@ def init_managers():
 # CORE FUNCTIONS
 # =============================================================================
 
-def get_current_task(prd: dict) -> Optional[dict]:
-    """Get next pending task."""
-    for story in prd.get("userStories", []):
-        if not story.get("passes", False) and not story.get("blocked", False):
-            return story
+def get_current_task(prd: dict = None) -> Optional[dict]:
+    """Get next pending task.
+    
+    DUAL-WRITE FIX: Uses TaskManager when available.
+    """
+    # Git-native path (preferred)
+    if GIT_STATE_AVAILABLE and _task_manager:
+        task = _task_manager.get_next_task()
+        if task:
+            # Convert to legacy format for compatibility
+            return {
+                "id": task.id,
+                "title": task.title,
+                "description": task.description,
+                "status": task.status,
+                "passes": task.status == "done",
+                "depends": task.depends,
+            }
+        return None
+    
+    # Fallback to PRD dict
+    if prd:
+        for story in prd.get("userStories", []):
+            if not story.get("passes", False) and not story.get("blocked", False):
+                return story
     return None
 
 
 def mark_task_done(task_id: str, passed: bool = True):
-    """Mark a task as done with proper file locking to prevent concurrent write corruption.
+    """Mark a task as done.
     
-    CRITICAL FIX: Uses fcntl.flock() for exclusive file locking instead of
-    optimistic locking. The original implementation had a TOCTOU race condition
-    where another process could write between version check and save.
-    
-    File locking ensures atomic read-modify-write operations.
-    
-    HIGH-5 FIX: Also updates TaskManager when git state is available.
+    DUAL-WRITE FIX: When TaskManager available, use ONLY TaskManager.
+    No more writing to both systems.
     """
-    # Update TaskManager first (git-native path)
+    # Git-native path (preferred)
     if GIT_STATE_AVAILABLE and _task_manager:
         status = "done" if passed else "failed"
         if _task_manager.set_task_status(task_id, status):
-            log(f"Task {task_id} marked {status} in TaskManager")
+            log(f"Task {task_id} marked {status} (git-native)")
+            return  # Done - no need to update PRD file
         else:
-            log_warning(f"Failed to update task {task_id} in TaskManager")
+            log_error(f"Failed to update task {task_id} in TaskManager")
+            return
     
-    # Also update legacy PRD for backward compatibility
+    # Fallback: Legacy PRD file (only when git state unavailable)
     max_retries = 3
     for attempt in range(max_retries):
         try:

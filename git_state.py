@@ -1050,8 +1050,11 @@ class TaskManager:
         
         return None
     
-    def _deps_met(self, task_id: str, visited: set) -> bool:
+    def _deps_met(self, task_id: str, visited: set = None) -> bool:
         """Check if dependencies are met, detecting cycles.
+        
+        MEDIUM FIX: Uses iterative BFS instead of recursion to avoid
+        stack overflow on deep dependency chains (Python limit ~1000).
         
         Args:
             task_id: Task to check
@@ -1060,26 +1063,40 @@ class TaskManager:
         Returns:
             True if all dependencies are satisfied
         """
-        # Cycle detection
-        if task_id in visited:
-            logger.warning(f"Circular dependency detected involving: {task_id}")
-            return False
+        if visited is None:
+            visited = set()
         
-        task = self._tasks.get(task_id)
-        if not task:
-            return True  # Missing task = assume satisfied
+        # BFS queue of tasks to check
+        queue = [task_id]
+        checked = set()
         
-        visited.add(task_id)
-        
-        for dep_id in task.depends:
-            dep = self._tasks.get(dep_id)
-            if not dep:
-                continue  # Missing dependency = ignore
-            if dep.status != "done":
+        while queue:
+            current_id = queue.pop(0)
+            
+            # Cycle detection
+            if current_id in visited:
+                logger.warning(f"Circular dependency detected involving: {current_id}")
                 return False
-            # Check transitive dependencies (recursive)
-            if not self._deps_met(dep_id, visited.copy()):
-                return False
+            
+            if current_id in checked:
+                continue
+            checked.add(current_id)
+            
+            task = self._tasks.get(current_id)
+            if not task:
+                continue  # Missing task = skip
+            
+            visited.add(current_id)
+            
+            for dep_id in task.depends:
+                dep = self._tasks.get(dep_id)
+                if not dep:
+                    continue  # Missing dependency = ignore
+                if dep.status != "done":
+                    return False
+                # Add to queue for transitive check
+                if dep_id not in checked:
+                    queue.append(dep_id)
         
         return True
     
